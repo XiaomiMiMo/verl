@@ -1,5 +1,3 @@
-updated 20260706
-
 # The ways verl integrates megatron-core
 There has been 3 ways that verl integrates megatron-core as it training backend:
 1. the codes inside this directory, which defines the conversion for new models one by one. (deprecated now)

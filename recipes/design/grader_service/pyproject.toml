@@ -1,0 +1,21 @@
+[project]
+name = "design-grader"
+version = "0.1.0"
+description = "Trajectory-in, reward-out grader for webdev design RL (group-relative, as a service)"
+requires-python = ">=3.10"
+# rl.py / client.py are stdlib-only by contract (imported inside RL env actors).
+# The service side needs:
+dependencies = []
+
+[project.optional-dependencies]
+service = ["playwright", "pillow"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"design_grader.service" = ["demos/*.jpg", "dashboard.html"]

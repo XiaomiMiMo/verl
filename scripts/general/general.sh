@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+export PROJECT_NAME="${PROJECT_NAME:-general_agent_rl}"
+export EXP_NAME="${EXP_NAME:-ga_train}"
+export GENERAL_MODE="${GENERAL_MODE:-train}"
+
+export GA_TASK_ROOT="${GA_TASK_ROOT:?set GA_TASK_ROOT to the open_source_env bundle root}"
+export TRAIN_DATA="${TRAIN_DATA:-${GA_TASK_ROOT}/parquet/train_1000_open.retagged.parquet}"
+export VAL_DATA="${VAL_DATA:-${GA_TASK_ROOT}/parquet/eval_300_open.retagged.parquet}"
+
+export MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to an HF id or a local checkpoint}"
+
+export GA_JUDGE_URL="${GA_JUDGE_URL:?set GA_JUDGE_URL to an OpenAI-compatible base URL}"
+export GA_JUDGE_KEY="${GA_JUDGE_KEY:?set GA_JUDGE_KEY (use EMPTY for a local vLLM)}"
+export GA_JUDGE_MODEL="${GA_JUDGE_MODEL:-gpt-4o-mini}"
+export GA_JUDGE_API="${GA_JUDGE_API:-chat}"
+
+export NNODES="${NNODES:-4}"
+export NGPUS_PER_NODE="${NGPUS_PER_NODE:-8}"
+export ACTOR_TP="${ACTOR_TP:-8}"
+export ROLLOUT_TP="${ROLLOUT_TP:-4}"
+export ROLLOUT_DP="${ROLLOUT_DP:-1}"
+
+export MAXLEN="${MAXLEN:-262144}"
+export PROMPT_LENGTH="${PROMPT_LENGTH:-49152}"
+export RESPONSE_LENGTH="${RESPONSE_LENGTH:-212992}"
+export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-262144}"
+
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
+export ROLLOUT_N="${ROLLOUT_N:-8}"
+
+export ACTOR_LR="${ACTOR_LR:-2e-6}"
+export TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
+
+export ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
+export ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.95}"
+export ROLLOUT_TOP_K="${ROLLOUT_TOP_K:--1}"
+export ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.75}"
+export ROLLOUT_MAX_RUNNING_REQUESTS="${ROLLOUT_MAX_RUNNING_REQUESTS:-64}"
+export AGENT_NUM_WORKERS="${AGENT_NUM_WORKERS:-32}"
+export VAL_KWARGS_N="${VAL_KWARGS_N:-4}"
+
+export REWARD_BINARIZE="${REWARD_BINARIZE:-True}"
+export REWARD_BINARIZE_THRESHOLD="${REWARD_BINARIZE_THRESHOLD:-1.0}"
+export INVALID_REWARD_FOR_INFRA="${INVALID_REWARD_FOR_INFRA:-true}"
+export INVALID_REWARD_VALUE="${INVALID_REWARD_VALUE:--999}"
+export FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-True}"
+export LENGTH_PENALTY_ENABLE="${LENGTH_PENALTY_ENABLE:-True}"
+export GENERAL_INFRA_METRICS="${GENERAL_INFRA_METRICS:-1}"
+
+export ENV_SETUP_TIMEOUT="${ENV_SETUP_TIMEOUT:-3600}"
+export TRAJECTORY_TIMEOUT="${TRAJECTORY_TIMEOUT:-1200}"
+export REWARD_TIMEOUT="${REWARD_TIMEOUT:-0}"
+export ENV_NUM_CPUS="${ENV_NUM_CPUS:-0.125}"
+export FAIL_ON_ENV_SETUP_ERROR="${FAIL_ON_ENV_SETUP_ERROR:-false}"
+export MIMOAGENT_BASH_MAX_TIMEOUT_MS="${MIMOAGENT_BASH_MAX_TIMEOUT_MS:-300000}"
+
+if [ "${GENERAL_MODE}" = "eval" ]; then
+  export EXP_NAME="${EXP_NAME/ga_train/ga_eval}"
+  export TRAIN_DATA="${TRAIN_DATA:-${VAL_DATA}}"
+fi
+
+exec bash "${REPO_ROOT}/recipes/general/run_general.sh" "$@"

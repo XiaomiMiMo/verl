@@ -30,7 +30,10 @@ requires-python = ">=3.10"
 # Note: While the formatter will attempt to format lines such that they remain within the line-length,
 # it isn't a hard upper bound, and formatted lines may exceed the line-length.
 line-length = 120
-exclude = ["scripts/legacy_model_merger.py"]
+# `recipes/design/grader_service` is a vendored snapshot of a service maintained in its own
+# repo, not code maintained here. Reformatting it would turn every re-sync into a merge
+# against a few hundred lint fixes instead of an overwrite. It is linted upstream.
+exclude = ["scripts/legacy_model_merger.py", "recipes/design/grader_service"]
 
 [tool.ruff.lint]
 isort = {known-first-party = ["verl"]}
@@ -64,6 +67,29 @@ ignore = [
     # deprecated import
     "UP035",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# The web-dev arm's tool descriptions are prompt text: the policy reads them on
+# every turn, so they are ported byte-for-byte from the run being reproduced.
+# They live inside triple-quoted f-strings, where a long line cannot be wrapped
+# without inserting a newline into the description itself -- which would change
+# the prompt. tests/recipes/design/ guards the content by comparing the whole
+# generated tool schema against the reference, so the bytes cannot drift
+# unnoticed just because the line length is not checked here.
+"recipes/design/webdev/tools/*.py" = ["E501"]
+
+# The general arm's catalogue is the same case and the same upstream source: the
+# capitalized Claude-Code tool descriptions, read by the policy on every turn and copied
+# byte-for-byte from the run being reproduced. Wrapping a line inside one of those
+# triple-quoted descriptions changes what the model sees.
+"recipes/general/tools/*.py" = ["E501"]
+
+# The evaluation rubric is the same case, one step more literal: its band descriptions and
+# prompt template ARE the scoring ruler, handed to the judge model verbatim. Wrapping a line
+# would insert a newline into the prompt, which measures something else and makes every
+# published number incomparable. A test pins the rendered prompt's sha256 for that reason,
+# so an accidental edit fails loudly rather than shifting the reward distribution quietly.
+"recipes/design/webdev/eval_rubric.py" = ["E501"]
 
 # -------------------------------
 # tool.mypy - typechecking config

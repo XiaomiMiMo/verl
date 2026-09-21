@@ -60,9 +60,10 @@ from verl.trainer.ppo.metric_utils import (
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
 )
-from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
-from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
+from verl.trainer.ppo.padding_utils import get_megatron_sequence_length_multiple, upsample_batch_to_divisible_size
+from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics, extract_spec_decode_stats
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+from verl.trainer.ppo.signed_rebalance import rebalance_dense
 from verl.trainer.ppo.utils import (
     Role,
     create_rl_dataset,
@@ -98,6 +99,259 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["temperature"] = 0
 
 
+def _apply_tool_call_error_strategy(
+    response_mask: torch.Tensor,
+    tool_call_error_mask: torch.Tensor | None,
+    strategy: str,
+    penalty_value: float,
+    metric_prefix: str = "tool_call_error",
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Apply the configured token-level policy for a marked-token channel.
+
+    Both masks are response-side padded tensors.  Invalid or absent metadata is
+    treated as an empty mask so a rollout cannot accidentally remove unrelated
+    tokens from training. ``metric_prefix`` names the channel in the emitted
+    metrics (``tool_call_error`` for the runner's per-turn format errors,
+    ``repetition`` for the framework's n-gram repetition hits).
+    """
+    if tool_call_error_mask is None or tool_call_error_mask.shape != response_mask.shape:
+        error_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    else:
+        error_mask = tool_call_error_mask.to(device=response_mask.device, dtype=torch.bool)
+    valid_mask = response_mask.to(dtype=torch.bool)
+    error_mask = error_mask & valid_mask
+
+    metrics = {
+        f"penalty/{metric_prefix}_tokens": float(error_mask.sum().detach().item()),
+        f"penalty/{metric_prefix}_sequences": float(error_mask.any(dim=-1).sum().detach().item()),
+        f"penalty/{metric_prefix}_rate": float(
+            error_mask.sum().detach().item() / max(valid_mask.sum().detach().item(), 1)
+        ),
+    }
+    if strategy == "mask":
+        return response_mask * (~error_mask).to(response_mask.dtype), error_mask, metrics
+    return response_mask, error_mask, metrics
+
+
+def _apply_marked_token_advantage_penalty(
+    data: DataProto,
+    marked_mask: torch.Tensor | None,
+    strategy: str,
+    penalty_value: float,
+    metrics: dict[str, Any],
+    metric_prefix: str,
+) -> None:
+    """Post-GRPO advantage edit for one marked-token channel (adv_reduction / adv_set)."""
+    if marked_mask is None or strategy not in ("adv_reduction", "adv_set"):
+        return
+    advantages = data.batch["advantages"]
+    if strategy == "adv_reduction":
+        reduction = marked_mask.to(advantages.dtype) * penalty_value
+        data.batch["advantages"] = advantages - reduction
+        if "returns" in data.batch:
+            data.batch["returns"] = data.batch["returns"] - reduction
+        metrics[f"penalty/{metric_prefix}_adv_reduction_total"] = float(reduction.sum().detach().item())
+        metrics[f"penalty/{metric_prefix}_adv_reduction_tokens"] = float((reduction != 0).sum().detach().item())
+        return
+    set_value = torch.as_tensor(penalty_value, dtype=advantages.dtype, device=advantages.device)
+    data.batch["advantages"] = torch.where(marked_mask, set_value, advantages)
+    set_tokens = int(marked_mask.sum().detach().item())
+    metrics[f"penalty/{metric_prefix}_adv_set_total"] = float(penalty_value * set_tokens)
+    metrics[f"penalty/{metric_prefix}_adv_set_tokens"] = float(set_tokens)
+
+
+_DEPTH_BUCKETS = ((0, 5, "t01_05"), (5, 20, "t06_20"), (20, 50, "t21_50"), (50, 100, "t51_100"), (100, 10**9, "t101p"))
+
+
+def _depth_bucket_mass_metrics(
+    response_mask: torch.Tensor,
+    advantages: torch.Tensor,
+    turn_index: torch.Tensor,
+    uids: np.ndarray,
+    metrics: dict[str, Any],
+    prefix: str,
+) -> None:
+    """Signed advantage token mass per generation-turn bucket under prompt-mean weights.
+
+    ``pos``/``neg`` are ``sum(w * A)`` over tokens with ``A > 0`` / ``A < 0`` where
+    ``w = 1 / (G * T_g)`` (G = prompt groups, T_g = group token count); ``neg_over_pos``
+    is the ratio. Only emitted by the experimental deep_failure_mask channel.
+    """
+    valid = response_mask.to(torch.bool)
+    counts: dict[Any, int] = {}
+    for uid, n in zip(uids.tolist(), valid.sum(dim=-1).tolist(), strict=True):
+        counts[uid] = counts.get(uid, 0) + int(n)
+    groups = max(sum(1 for c in counts.values() if c > 0), 1)
+    row_w = torch.tensor(
+        [1.0 / (groups * counts[uid]) if counts[uid] > 0 else 0.0 for uid in uids.tolist()],
+        dtype=torch.float32,
+        device=advantages.device,
+    ).unsqueeze(-1)
+    contrib = torch.where(
+        valid, advantages.to(torch.float32) * row_w, torch.zeros_like(row_w).expand_as(valid).to(torch.float32)
+    )
+    for lo, hi, name in _DEPTH_BUCKETS:
+        sel = valid & (turn_index >= lo) & (turn_index < hi)
+        c = contrib[sel]
+        pos = float(c[c > 0].sum().item()) if c.numel() else 0.0
+        neg = float(-c[c < 0].sum().item()) if c.numel() else 0.0
+        metrics[f"{prefix}/{name}/pos_mass"] = pos
+        metrics[f"{prefix}/{name}/neg_mass"] = neg
+        metrics[f"{prefix}/{name}/neg_over_pos"] = neg / pos if pos > 0 else 0.0
+        metrics[f"{prefix}/{name}/tokens"] = float(sel.sum().item())
+
+
+def _apply_deep_failure_mask(
+    response_mask: torch.Tensor,
+    advantages: torch.Tensor,
+    turn_index: torch.Tensor | None,
+    scores: torch.Tensor,
+    uids: np.ndarray,
+    strategy: str,
+    alpha: float,
+    metrics: dict[str, Any],
+) -> torch.Tensor:
+    """EXPERIMENTAL ``algorithm.deep_failure_mask``: drop deep-turn tails from the loss.
+
+    Per prompt group ``k = ceil(alpha * median(turns of successful trajectories))``.
+    ``mask_failure`` clears tokens with ``turn_index >= k`` on negative-advantage rows;
+    ``mask_both`` clears them on every row. Groups without a success are untouched.
+    Fails closed when ``turn_index`` is missing or misaligned. Returns the edited
+    padded ``response_mask``; advantages are not modified.
+    """
+    valid = response_mask.to(torch.bool)
+    if turn_index is None or turn_index.shape != response_mask.shape:
+        metrics["penalty/deep_failure_mask_status"] = 0.0  # 0 = field missing/misaligned
+        metrics["penalty/deep_failure_mask_tokens"] = 0.0
+        return response_mask
+    turn_index = turn_index.to(device=response_mask.device, dtype=torch.long)
+    row_adv = torch.where(valid, advantages, torch.zeros_like(advantages)).sum(dim=-1)
+    row_adv = row_adv / valid.sum(dim=-1).clamp(min=1).to(row_adv.dtype)
+    row_turns = torch.where(valid, turn_index, torch.full_like(turn_index, -1)).amax(dim=-1) + 1
+    positive = scores >= 0.5
+    drop = torch.zeros_like(valid)
+    thresholds: list[float] = []
+    groups: dict[Any, list[int]] = {}
+    for row, uid in enumerate(uids.tolist()):
+        groups.setdefault(uid, []).append(row)
+    for rows in groups.values():
+        rows_t = torch.as_tensor(rows, device=response_mask.device)
+        succ_turns = row_turns[rows_t][positive[rows_t]]
+        if succ_turns.numel() == 0:
+            continue
+        k = int(math.ceil(alpha * float(np.median(succ_turns.cpu().numpy()))))
+        thresholds.append(float(k))
+        deep = turn_index[rows_t] >= k
+        if strategy == "mask_failure":
+            deep = deep & (row_adv[rows_t] < 0).unsqueeze(-1)
+        drop[rows_t] = deep & valid[rows_t]
+    neg_tokens = (valid & (row_adv < 0).unsqueeze(-1)).sum().item()
+    metrics["penalty/deep_failure_mask_status"] = 1.0
+    metrics["penalty/deep_failure_mask_tokens"] = float(drop.sum().item())
+    metrics["penalty/deep_failure_mask_sequences"] = float(drop.any(dim=-1).sum().item())
+    metrics["penalty/deep_failure_mask_failure_token_frac"] = float(drop.sum().item() / max(neg_tokens, 1))
+    metrics["penalty/deep_failure_mask_rate"] = float(drop.sum().item() / max(valid.sum().item(), 1))
+    metrics["penalty/deep_failure_mask_k_mean"] = float(np.mean(thresholds)) if thresholds else 0.0
+    metrics["penalty/deep_failure_mask_groups"] = float(len(thresholds))
+    return response_mask * (~drop).to(response_mask.dtype)
+
+
+def _split_early_stop_mask(
+    response_mask: torch.Tensor, repetition_mask: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """the reference RL framework early_stop split: ``(prefix_mask, hit_mask)`` from a padded repetition mask.
+
+    ``hit_mask`` is the marked spans (bool, valid tokens only). ``prefix_mask`` is every
+    valid token strictly before the first marked token of its row; rows without a hit
+    get an all-False prefix. Tokens after the hit span stay in ``hit`` semantics only if
+    marked; unmarked tokens after the first hit are left untouched (the framework's
+    session-wide zero_reward already makes them negative).
+    """
+    valid = response_mask.to(torch.bool)
+    if repetition_mask is None or repetition_mask.shape != response_mask.shape:
+        empty = torch.zeros_like(valid)
+        return empty, empty
+    hit = repetition_mask.to(device=response_mask.device, dtype=torch.bool) & valid
+    has_hit = hit.any(dim=-1)
+    first = torch.where(has_hit, hit.to(torch.int8).argmax(dim=-1), torch.full_like(has_hit, 0, dtype=torch.long))
+    positions = torch.arange(valid.shape[-1], device=valid.device).unsqueeze(0)
+    prefix = valid & has_hit.unsqueeze(-1) & (positions < first.unsqueeze(-1))
+    return prefix, hit
+
+
+def _log_harness_rollout_metrics(
+    metrics: dict[str, Any],
+    harness_values: Any,
+    reward_tensor: torch.Tensor,
+    response_mask: torch.Tensor,
+    entropys: torch.Tensor | None = None,
+    num_turns: Any | None = None,
+    tool_call_error_values: dict[str, Any] | None = None,
+) -> None:
+    """Add per-harness rollout metrics when the runner identifies a harness.
+
+    Mixed-harness training carries ``agent_type`` (and, for compatibility,
+    ``selected_harness``) in reward extra info. Grouping here preserves the
+    normal aggregate metrics while making reward, response length, entropy, and
+    turn-count and tool-call error statistics comparable in TensorBoard without
+    changing sampling or optimization.
+    """
+    if harness_values is None:
+        return
+    values = np.asarray(harness_values, dtype=object).reshape(-1)
+    if not len(values):
+        return
+    rewards = reward_tensor.sum(dim=-1).detach().float().reshape(-1)
+    lengths = response_mask.to(torch.float32).sum(dim=-1).detach().reshape(-1)
+    entropy_values = None
+    if entropys is not None:
+        entropy_values = entropys.detach().float()
+        if entropy_values.ndim > 1:
+            entropy_values = (entropy_values * response_mask.to(entropy_values.dtype)).sum(dim=-1) / response_mask.sum(
+                dim=-1
+            ).clamp_min(1)
+        entropy_values = entropy_values.reshape(-1)
+    turn_values = None
+    if num_turns is not None:
+        turn_values = np.asarray(num_turns).reshape(-1)
+    error_values: dict[str, np.ndarray] = {}
+    for key, raw_values in (tool_call_error_values or {}).items():
+        values_array = np.asarray(raw_values, dtype=float).reshape(-1)
+        if values_array.size:
+            error_values[key] = values_array
+    n = min(len(values), rewards.numel(), lengths.numel())
+    if turn_values is not None:
+        n = min(n, len(turn_values))
+    for values_array in error_values.values():
+        n = min(n, len(values_array))
+    groups: dict[str, list[int]] = defaultdict(list)
+    for index, value in enumerate(values[:n]):
+        name = str(value or "unknown").strip().replace("/", "_")
+        groups[name or "unknown"].append(index)
+    for name, indices in groups.items():
+        index_tensor = torch.as_tensor(indices, device=rewards.device, dtype=torch.long)
+        prefix = f"harness/{name}"
+        metrics[f"{prefix}/reward_mean"] = rewards.index_select(0, index_tensor).mean().item()
+        metrics[f"{prefix}/response_length_mean"] = lengths.index_select(0, index_tensor).mean().item()
+        if entropy_values is not None and entropy_values.numel() >= n:
+            metrics[f"{prefix}/entropy_mean"] = entropy_values.index_select(0, index_tensor).mean().item()
+        if turn_values is not None:
+            group_turns = turn_values[indices]
+            metrics[f"{prefix}/num_turns/mean"] = float(group_turns.mean())
+            metrics[f"{prefix}/num_turns/min"] = float(group_turns.min())
+            metrics[f"{prefix}/num_turns/max"] = float(group_turns.max())
+        for key, values_array in error_values.items():
+            group_errors = values_array[indices]
+            metrics[f"{prefix}/{key}/mean"] = float(group_errors.mean())
+            if key == "tool_call_error_count":
+                metrics[f"{prefix}/tool_call_error_rate"] = float(np.mean(group_errors > 0))
+
+    if n and "tool_call_error_count" in error_values:
+        all_errors = error_values["tool_call_error_count"][:n]
+        metrics["rollout/tool_call_error_rate"] = float(np.mean(all_errors > 0))
+        metrics["rollout/tool_call_error_count/mean"] = float(all_errors.mean())
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
@@ -129,6 +383,12 @@ class PPOTrainer(ABC):
         self.use_teacher_policy = need_teacher_policy(self.config)
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        self.reference_penalties = None
+        if OmegaConf.select(self.config, "algorithm.arvo_penalties.enable", default=False):
+            from verl.trainer.ppo.arvo_penalties import ReferencePenalties
+
+            self.reference_penalties = ReferencePenalties.for_training(self.config)
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
@@ -450,7 +710,7 @@ class PPOTrainer(ABC):
                 self.on_step_begin()
 
                 self._start_profiling()
-                batch = self.step(metrics, self.timing_raw)
+                batch = self.step(metrics, self.timing_raw, prefetch_next_batch=not is_last_step)
                 self._stop_profiling()
 
                 # 2. save checkpoint
@@ -506,7 +766,7 @@ class PPOTrainer(ABC):
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
 
-    def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+    def step(self, metrics: dict, timing_raw: dict, *, prefetch_next_batch: bool = True) -> KVBatchMeta:
         train_batch_size = self.config.data.train_batch_size
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
@@ -514,7 +774,8 @@ class PPOTrainer(ABC):
         )
         sample_batch_size = train_batch_size // self.parameter_sync_step
 
-        self._add_batch_to_generate()
+        if prefetch_next_batch:
+            self._add_batch_to_generate()
 
         metrics_aggregator = MetricsAggregator()
         combined_keys: list = []
@@ -1105,7 +1366,10 @@ class PPOTrainer(ABC):
                 reward_extra_infos_dict={
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
                 }
-                | {"uid": dump_all_keys},
+                | {
+                    "uid": dump_all_keys,
+                    "num_turns": [sample_turns[i] for i in session_final_indices],
+                },
                 dump_path=val_data_dir,
             )
 
@@ -1450,6 +1714,28 @@ class PPOTrainer(ABC):
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
+    def _get_padding_sequence_length_multiple(self) -> int:
+        """Return an alignment accepted by every Megatron model that consumes the batch."""
+        model_configs = [self.config.actor_rollout_ref.actor]
+        if self.use_reference_policy:
+            model_configs.append(self.config.actor_rollout_ref.ref)
+        if self.use_critic:
+            model_configs.append(self.config.critic)
+
+        required_multiple = 1
+        for model_config in model_configs:
+            if model_config.get("strategy") != "megatron":
+                continue
+            megatron_config = model_config.get("megatron")
+            if megatron_config is None:
+                continue
+            model_multiple = get_megatron_sequence_length_multiple(
+                tensor_parallel_size=megatron_config.get("tensor_model_parallel_size", 1),
+                context_parallel_size=megatron_config.get("context_parallel_size", 1),
+            )
+            required_multiple = math.lcm(required_multiple, model_multiple)
+        return required_multiple
+
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
         # get actor dp size
@@ -1463,7 +1749,13 @@ class PPOTrainer(ABC):
 
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
-        batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+        sequence_length_multiple = self._get_padding_sequence_length_multiple()
+        batch = upsample_batch_to_divisible_size(
+            batch,
+            batch_multiple,
+            self.tokenizer.eos_token_id,
+            sequence_length_multiple=sequence_length_multiple,
+        )
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
@@ -1493,9 +1785,11 @@ class PPOTrainer(ABC):
             return batch
 
         # 1. compute log probs
+        actor_config = self.config.actor_rollout_ref.actor
+        calculate_entropy = actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0
         batch.extra_info.update(
             {
-                "calculate_entropy": True,
+                "calculate_entropy": calculate_entropy,
                 "compute_loss": False,
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             }
@@ -1503,33 +1797,39 @@ class PPOTrainer(ABC):
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
-        fields = ["entropy", "log_probs", "response_mask"]
+        fields = ["log_probs", "response_mask"] + (["entropy"] if calculate_entropy else [])
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
-        batch = tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
-        )
+        put_fields = ["old_log_probs"]
+        if calculate_entropy:
+            data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+            put_fields.append("entropy")
+        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select(*put_fields))
 
         data = DataProto(batch=data.to_padded_tensor())
 
-        # 3. calculate actor entroy metrics
-        actor_config = self.config.actor_rollout_ref.actor
-        entropy_agg = agg_loss(
-            loss_mat=data.batch["entropy"],
-            loss_mask=data.batch["response_mask"],
-            loss_agg_mode=actor_config.loss_agg_mode,
-            loss_scale_factor=actor_config.loss_scale_factor,
-        )
-        old_log_prob_metrics = {
-            "actor/entropy": entropy_agg.detach().item(),
-            # "perf/mfu/actor_infer": old_log_prob_mfu,
-        }
-        metrics.update(old_log_prob_metrics)
+        if calculate_entropy:
+            entropy_prompt_weights = None
+            if actor_config.loss_agg_mode == "prompt-mean":
+                entropy_prompt_weights = core_algos.compute_prompt_loss_weights(
+                    data.batch["response_mask"], [key.rsplit("_", 2)[0] for key in batch.keys]
+                )
+            entropy_agg = agg_loss(
+                loss_mat=data.batch["entropy"],
+                loss_mask=data.batch["response_mask"],
+                loss_agg_mode=actor_config.loss_agg_mode,
+                loss_scale_factor=actor_config.loss_scale_factor,
+                prompt_loss_weights=entropy_prompt_weights,
+            )
+            metrics.update({"actor/entropy": entropy_agg.detach().item()})
+            if actor_config.loss_agg_mode == "prompt-mean":
+                metrics["actor/entropy_token_mean"] = (
+                    agg_loss(data.batch["entropy"], data.batch["response_mask"], "token-mean").detach().item()
+                )
 
         # 4. calculate rollout vs actor logprobs diff
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
@@ -1585,15 +1885,104 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _rewrite_webdev_group_rewards(self, batch: KVBatchMeta, data, metrics: dict) -> None:
+        """Replace the design/web-dev arm's placeholder rewards with its group verdict.
+
+        Reads ``extra_fields`` with its own fetch rather than joining the caller's field
+        list: ``data`` has already been through ``to_padded_tensor()``, which has nowhere to
+        put a dict.
+
+        Fail-open by design. A rewrite that raises leaves the placeholders in place, and a
+        placeholder group is internally equal, so it contributes no gradient rather than a
+        wrong one. The metric exists because the log line alone is too easy to miss -- the
+        symptom otherwise is rewards that sit at 0.0 for a whole run with nothing else
+        apparently wrong.
+        """
+        try:
+            ef_data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+            extra_fields_list = [
+                getattr(ef, "data", ef) if hasattr(ef, "data") else (ef if isinstance(ef, dict) else {})
+                for ef in list(ef_data.get("extra_fields", []))
+            ]
+            if extra_fields_list and any(ef.get("webdev_group_pending") for ef in extra_fields_list):
+                from recipes.design.webdev.group_reward import apply_group_reward
+
+                metrics.update(
+                    apply_group_reward(data, extra_fields_list=extra_fields_list, global_step=self.global_steps)
+                )
+        except Exception as e:
+            logger.warning("webdev group rewrite failed (non-fatal, rewards untouched): %s", e)
+            metrics["webdev_group/hook_failed"] = 1.0
+
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        tool_penalty_config = self.config.algorithm.get("tool_call_error_penalty", {}) or {}
+        tool_penalty_enabled = bool(tool_penalty_config.get("enable", False))
+        tool_penalty_strategy = str(tool_penalty_config.get("strategy", "monitor"))
+        tool_penalty_value = float(tool_penalty_config.get("penalty_value", 0.0) or 0.0)
+        repetition_config = self.config.algorithm.get("repetition_penalty", {}) or {}
+        repetition_enabled = bool(repetition_config.get("enable", False))
+        repetition_strategy = str(repetition_config.get("strategy", "monitor"))
+        repetition_value = float(repetition_config.get("penalty_value", 0.0) or 0.0)
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        if tool_penalty_enabled:
+            fields.append("tool_call_error_mask")
+        if repetition_enabled:
+            fields.append("repetition_mask")
+        deep_mask_config = self.config.algorithm.get("deep_failure_mask", {}) or {}
+        deep_mask_enabled = bool(deep_mask_config.get("enable", False))
+        if deep_mask_enabled:
+            fields.append("turn_index")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+
+        error_mask = None
+        response_mask_edited = False
+        if tool_penalty_enabled:
+            response_mask_padded = data.batch["response_mask"]
+            error_mask = data.batch.get("tool_call_error_mask")
+            data.batch["response_mask"], error_mask, penalty_metrics = _apply_tool_call_error_strategy(
+                response_mask_padded,
+                error_mask,
+                tool_penalty_strategy,
+                tool_penalty_value,
+            )
+            metrics.update(penalty_metrics)
+            response_mask_edited |= tool_penalty_strategy == "mask"
+        repetition_mask = None
+        repetition_signed_strategy = repetition_strategy
+        if repetition_enabled and repetition_strategy == "early_stop":
+            prefix_mask, hit_mask = _split_early_stop_mask(
+                data.batch["response_mask"], data.batch.get("repetition_mask")
+            )
+            valid_tokens = float(data.batch["response_mask"].to(torch.bool).sum().item())
+            metrics["penalty/repetition_tokens"] = float(hit_mask.sum().item())
+            metrics["penalty/repetition_sequences"] = float(hit_mask.any(dim=-1).sum().item())
+            metrics["penalty/repetition_rate"] = float(hit_mask.sum().item() / max(valid_tokens, 1.0))
+            metrics["penalty/repetition_prefix_masked_tokens"] = float(prefix_mask.sum().item())
+            metrics["penalty/repetition_prefix_masked_rate"] = float(prefix_mask.sum().item() / max(valid_tokens, 1.0))
+            data.batch["response_mask"] = data.batch["response_mask"] * (~prefix_mask).to(
+                data.batch["response_mask"].dtype
+            )
+            repetition_mask = hit_mask
+            repetition_signed_strategy = "adv_signed"
+            response_mask_edited = True
+        elif repetition_enabled:
+            data.batch["response_mask"], repetition_mask, repetition_metrics = _apply_tool_call_error_strategy(
+                data.batch["response_mask"],
+                data.batch.get("repetition_mask"),
+                repetition_strategy,
+                repetition_value,
+                metric_prefix="repetition",
+            )
+            metrics.update(repetition_metrics)
+            response_mask_edited |= repetition_strategy == "mask"
+        if response_mask_edited:
+            response_mask = response_to_nested(data.batch["response_mask"], response_mask)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1603,6 +1992,21 @@ class PPOTrainer(ABC):
             metrics.update(kl_metrics)
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+
+        if self.reference_penalties is not None:
+            _ef = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+            _infos = list(_ef["extra_fields"])
+            _gen_mask = data.batch["response_mask"].clone()
+            data.batch["token_level_rewards"], _lp_metrics = self.reference_penalties.shape_training_rewards(
+                data.batch["token_level_rewards"],
+                _gen_mask,
+                batch.keys,
+                _infos,
+            )
+            metrics.update(_lp_metrics)
+
+        if os.environ.get("WEBDEV_GRADE_MODE"):
+            self._rewrite_webdev_group_rewards(batch, data, metrics)
 
         # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
         # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -1616,7 +2020,36 @@ class PPOTrainer(ABC):
             data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
             metrics.update(is_metrics)
 
+        if os.environ.get("DROP_INFRA_FROM_GROUP", "0") == "1" or self.reference_penalties is not None:
+            try:
+                _ef = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+                _is_infra = [float(e.get("is_infra", 0.0)) for e in list(_ef["extra_fields"])]
+                _uid = data.non_tensor_batch["uid"]
+                if len(_is_infra) == len(_uid):
+                    _n_excluded = 0
+                    for _i in range(len(_uid)):
+                        if _is_infra[_i] > 0.5:
+                            _uid[_i] = f"__infra_excluded__{uuid.uuid4()}"
+                            _n_excluded += 1
+                    metrics["training/infra/excluded_from_grpo"] = float(_n_excluded)
+                else:
+                    logger.warning(
+                        "[infra-grpo] length mismatch is_infra=%d uid=%d; skipped",
+                        len(_is_infra),
+                        len(_uid),
+                    )
+            except Exception as e:
+                logger.warning("[infra-grpo] exclusion skipped, GRPO unchanged this step: %s", e)
+
         # 3. compute advantages
+        group_suffixes = None
+        if bool(self.config.algorithm.get("group_advantage_by_harness", False)):
+            harness_values = [str(tag.get("agent_type") or "unknown") for tag in batch.tags]
+            if any(value == "unknown" for value in harness_values):
+                raise RuntimeError(
+                    "algorithm.group_advantage_by_harness=true requires agent_type on every trajectory tag"
+                )
+            group_suffixes = np.asarray(harness_values, dtype=object)
         data = compute_advantage_for_multi_trajectories(
             data,
             batch_keys=batch.keys,
@@ -1626,20 +2059,171 @@ class PPOTrainer(ABC):
             num_repeat=self.config.actor_rollout_ref.rollout.n,
             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
             config=self.config.algorithm,
+            group_suffixes=group_suffixes,
         )
+
+        if deep_mask_enabled:
+            if (
+                data.batch.get("turn_index") is not None
+                and data.batch["turn_index"].shape == data.batch["response_mask"].shape
+            ):
+                _depth_bucket_mass_metrics(
+                    data.batch["response_mask"],
+                    data.batch["advantages"],
+                    data.batch["turn_index"].to(torch.long),
+                    data.non_tensor_batch["uid"],
+                    metrics,
+                    "depth_mass/before_mask",
+                )
+            data.batch["response_mask"] = _apply_deep_failure_mask(
+                data.batch["response_mask"],
+                data.batch["advantages"],
+                data.batch.get("turn_index"),
+                data.batch["token_level_scores"].sum(dim=-1),
+                data.non_tensor_batch["uid"],
+                str(deep_mask_config.get("strategy", "mask_failure")),
+                float(deep_mask_config.get("alpha", 1.0)),
+                metrics,
+            )
+            if (
+                data.batch.get("turn_index") is not None
+                and data.batch["turn_index"].shape == data.batch["response_mask"].shape
+            ):
+                _depth_bucket_mass_metrics(
+                    data.batch["response_mask"],
+                    data.batch["advantages"],
+                    data.batch["turn_index"].to(torch.long),
+                    data.non_tensor_batch["uid"],
+                    metrics,
+                    "depth_mass/after_mask",
+                )
+            response_mask = response_to_nested(data.batch["response_mask"], response_mask)
+            response_mask_edited = True
+        if tool_penalty_enabled:
+            _apply_marked_token_advantage_penalty(
+                data, error_mask, tool_penalty_strategy, tool_penalty_value, metrics, "tool_call_error"
+            )
+        if repetition_enabled:
+            _apply_marked_token_advantage_penalty(
+                data, repetition_mask, repetition_strategy, repetition_value, metrics, "repetition"
+            )
+        signed_channels = [
+            (mask, value)
+            for enabled, mask, strategy, value in (
+                (tool_penalty_enabled, error_mask, tool_penalty_strategy, tool_penalty_value),
+                (repetition_enabled, repetition_mask, repetition_signed_strategy, repetition_value),
+            )
+            if enabled and strategy == "adv_signed" and mask is not None
+        ]
+        if signed_channels:
+            kappa = torch.zeros_like(data.batch["advantages"], dtype=torch.float32)
+            for mask, value in signed_channels:
+                kappa = torch.maximum(kappa, mask.to(torch.float32) * float(value))
+            row_weights = None
+            if self.config.actor_rollout_ref.actor.loss_agg_mode == "prompt-mean":
+                row_weights = core_algos.compute_prompt_loss_weights(
+                    data.batch["response_mask"], data.non_tensor_batch["uid"]
+                )
+            data.batch["advantages"], signed_metrics = rebalance_dense(
+                data.batch["advantages"],
+                kappa,
+                data.batch["response_mask"],
+                min_scale=float(self.config.algorithm.get("signed_min_scale", 0.5)),
+                max_scale=float(self.config.algorithm.get("signed_max_scale", 2.0)),
+                row_weights=row_weights,
+            )
+            metrics.update(signed_metrics)
+            if "returns" in data.batch:
+                data.batch["returns"] = data.batch["advantages"].clone()
+
+        if self.reference_penalties is not None:
+            _ef = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+            _infos = list(_ef["extra_fields"])
+            _gen_mask = data.batch["response_mask"].clone()
+            data.batch["advantages"], _tp_metrics = self.reference_penalties.apply_tool_penalty(
+                data.batch["advantages"],
+                data.batch["response_mask"],
+                _gen_mask,
+                _infos,
+            )
+            metrics.update(_tp_metrics)
+            if "returns" in data.batch:
+                data.batch["returns"] = data.batch["advantages"].clone()
+
+        if os.environ.get("WEBDEV_GRADE_MODE"):
+            try:
+                from recipes.design.webdev.gradient_yield import gradient_yield_metrics
+
+                _ef = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+                _is_infra = np.array([float(e.get("is_infra", 0.0)) for e in list(_ef["extra_fields"])], dtype=float)
+                metrics.update(
+                    gradient_yield_metrics(
+                        advantages=data.batch["advantages"],
+                        response_mask=data.batch["response_mask"],
+                        token_level_scores=data.batch.get("token_level_scores"),
+                        is_infra=_is_infra,
+                        keep=np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool),
+                    )
+                )
+            except Exception as e:
+                logger.warning("[adv-metric] gradient-yield metrics skipped: %s", e)
+
+        if os.environ.get("GENERAL_INFRA_METRICS"):
+            try:
+                from recipes.general.infra_metrics import infra_metrics
+
+                _ef = tq.kv_batch_get(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                    select_fields=["extra_fields", "num_turns"],
+                )
+                _extra = [dict(e) if isinstance(e, dict) else {} for e in list(_ef["extra_fields"])]
+                _turns = _ef.get("num_turns")
+                metrics.update(
+                    infra_metrics(
+                        advantages=data.batch["advantages"],
+                        response_mask=data.batch["response_mask"],
+                        token_level_scores=data.batch.get("token_level_scores"),
+                        is_infra=np.array([float(e.get("is_infra", 0.0)) for e in _extra], dtype=float),
+                        error_categories=[e.get("error_category") for e in _extra],
+                        num_turns=np.asarray(_turns).reshape(-1) if _turns is not None else None,
+                        keep=np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool),
+                    )
+                )
+            except Exception as e:
+                logger.warning("[infra-metric] general infra metrics skipped: %s", e)
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
         if self.config.algorithm.use_kl_in_reward:
             fields.append("token_level_rewards")
-        if rollout_correction:
+        if response_mask_edited:
             fields.append("response_mask")
+        if rollout_correction:
+            if "response_mask" not in fields:
+                fields.append("response_mask")
             if "rollout_is_weights" in data.batch:
                 fields.append("rollout_is_weights")
 
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
+        if self.config.actor_rollout_ref.actor.loss_agg_mode == "prompt-mean":
+            prompt_weights = core_algos.compute_prompt_loss_weights(
+                data.batch["response_mask"], data.non_tensor_batch["uid"]
+            )
+            output["prompt_loss_weights"] = prompt_weights
+            token_counts = data.batch["response_mask"].to(torch.bool).sum(dim=-1)
+            metrics["loss/prompt_mean_weight_sum"] = float((prompt_weights * token_counts).sum().item())
+            metrics["loss/prompt_mean_prompt_count"] = float(
+                len(
+                    {
+                        uid
+                        for uid, count in zip(data.non_tensor_batch["uid"], token_counts.tolist(), strict=True)
+                        if count > 0
+                    }
+                )
+            )
         output = TensorDict(output, batch_size=len(batch))
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
@@ -1673,6 +2257,8 @@ class PPOTrainer(ABC):
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        if self.config.actor_rollout_ref.actor.loss_agg_mode == "prompt-mean" and len(batch) != ppo_mini_batch_size:
+            raise ValueError("prompt-mean requires one optimizer minibatch containing the complete sampled batch")
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
@@ -1723,7 +2309,14 @@ class PPOTrainer(ABC):
             "rm_scores",
             "token_level_rewards",
             "num_turns",
+            "uid",
+            "data_source",
         ]
+        if (
+            self.config.actor_rollout_ref.actor.calculate_entropy
+            or self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        ):
+            fields.append("entropy")
         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
         data = get_metric_data_with_optional_routed_experts(
             keys=batch.keys,
@@ -1741,6 +2334,39 @@ class PPOTrainer(ABC):
         global_token_num = (prompt_length + response_length).tolist()
         min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
         max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+        harness_values = [tag.get("agent_type") for tag in batch.tags]
+        harness_values = [value for value, keep in zip(harness_values, non_padding_mask, strict=True) if keep]
+        tool_call_error_keys = (
+            "tool_call_error_count",
+            "tool_call_error_unknown_tool_count",
+            "tool_call_error_invalid_arguments_count",
+            "tool_call_error_incompatible_payload_count",
+            "tool_call_error_other_tool_error_count",
+            "codex_transport_error_count",
+        )
+        tool_call_error_values = {
+            key: [int(tag.get(key) or 0) for tag, keep in zip(batch.tags, non_padding_mask, strict=True) if keep]
+            for key in tool_call_error_keys
+        }
+        repetition_hits = np.array(
+            [
+                int(tag.get("repetition_hit") or 0)
+                for tag, keep in zip(batch.tags, non_padding_mask, strict=True)
+                if keep
+            ],
+            dtype=float,
+        )
+        if repetition_hits.size:
+            metrics["rollout/repetition_hit_rate"] = float(repetition_hits.mean())
+            metrics["rollout/repetition_hit_count"] = float(repetition_hits.sum())
+            metrics["rollout/repetition_zeroed_reward_count"] = float(
+                sum(
+                    int(tag.get("repetition_zeroed_reward") or 0)
+                    for tag, keep in zip(batch.tags, non_padding_mask, strict=True)
+                    if keep
+                )
+            )
+            tool_call_error_values["repetition_hit"] = repetition_hits.tolist()
 
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None
@@ -1751,10 +2377,7 @@ class PPOTrainer(ABC):
                 partition_id=batch.partition_id,
                 select_fields=["extra_fields"],
             )
-            extra_fields = spec_data["extra_fields"].tolist()
-            spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
-            spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
-            spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
+            spec_drafts, spec_accepts, spec_verifies = extract_spec_decode_stats(spec_data)
 
         data = data.to_padded_tensor()
         data["token_level_scores"] = data["rm_scores"]
@@ -1762,7 +2385,11 @@ class PPOTrainer(ABC):
             data["token_level_rewards"] = data["rm_scores"]
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
-        batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+        _grouping: dict = {}
+        for _key in ("uid", "data_source"):
+            if _key in data.keys():
+                _grouping[_key] = np.array(data.pop(_key).tolist(), dtype=object)
+        batch = DataProto(batch=data, non_tensor_batch=_grouping, meta_info={"global_token_num": global_token_num})
         metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 
         # 2. compute metrics
@@ -1775,7 +2402,27 @@ class PPOTrainer(ABC):
                 accumulator=self._rollout_moe_lb_metrics_accumulator,
             )
         )
-        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        metrics.update(
+            compute_data_metrics(
+                batch=metrics_batch,
+                use_critic=self.use_critic,
+                invalid_reward_value=self.config.algorithm.get("invalid_reward_value", None),
+            )
+        )
+        if any(value is not None for value in harness_values):
+            try:
+                entropy_batch = metrics_batch.batch.get("entropy")
+                _log_harness_rollout_metrics(
+                    metrics,
+                    harness_values,
+                    metrics_batch.batch["rm_scores"],
+                    metrics_batch.batch["response_mask"],
+                    entropys=entropy_batch,
+                    num_turns=num_turns[non_padding_mask] if non_padding_mask.any() else num_turns,
+                    tool_call_error_values=tool_call_error_values,
+                )
+            except (AttributeError, TypeError, KeyError, RuntimeError) as exc:
+                logger.warning("Skipping per-harness metrics because agent_type tags could not be used: %s", exc)
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

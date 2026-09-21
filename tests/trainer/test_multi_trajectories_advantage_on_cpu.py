@@ -84,3 +84,40 @@ def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
     )
     assert torch.equal(result.batch["advantages"], adv_expected)
     assert torch.equal(result.batch["returns"], adv_expected)
+
+
+def test_compute_advantage_groups_same_prompt_by_harness_suffix(batch_data: DataProto):
+    result = compute_advantage_for_multi_trajectories(
+        data=batch_data,
+        batch_keys=[f"prompt_a_{session}_0" for session in range(len(batch_data))],
+        adv_estimator=AdvantageEstimator.GRPO,
+        norm_adv_by_std_in_grpo=False,
+        group_suffixes=["default", "default", "codex", "codex", "codex", "codex"],
+    )
+
+    default_expected = compute_advantage(
+        batch_data.select_idxs([0, 1]),
+        adv_estimator=AdvantageEstimator.GRPO,
+        norm_adv_by_std_in_grpo=False,
+    ).batch["advantages"]
+    codex_expected = compute_advantage(
+        batch_data.select_idxs([2, 3, 4, 5]),
+        adv_estimator=AdvantageEstimator.GRPO,
+        norm_adv_by_std_in_grpo=False,
+    ).batch["advantages"]
+    expected = torch.cat([default_expected, codex_expected])
+    expected = (
+        torch.stack(
+            [
+                expected[0, 0].expand(4),
+                expected[1, 0].expand(4),
+                expected[2].clone(),
+                expected[3].clone(),
+                expected[4].clone(),
+                expected[5].clone(),
+            ]
+        )
+        * batch_data.batch["response_mask"]
+    )
+    assert torch.equal(result.batch["advantages"], expected)
+    assert torch.equal(result.batch["returns"], expected)

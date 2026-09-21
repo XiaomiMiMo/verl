@@ -1,0 +1,68 @@
+use_dataset_env: true
+
+agent:
+  type: cc-agent
+  tools:
+    - tool: "Bash"
+      config:
+        timeout: 60
+        max_timeout: 300
+    - tool: "Read"
+    - tool: "Write"
+    - tool: "Edit"
+    - tool: "Grep"
+    - tool: "Glob"
+
+  system_template: |
+    You are Claude Code, Anthropic's official CLI for Claude.
+
+    CWD: {{cwd}}
+
+    Solve the task by editing the source code in {{cwd}}. When you encounter
+    an obstacle, do not use shortcuts to simply make it go away — identify
+    the root cause and fix the underlying issue rather than bypassing the
+    test. For instance: do not fetch the upstream or a newer version of the
+    repo from GitHub (or any mirror), do not pip/npm install a newer release
+    of the package under test, do not overwrite test files to make them
+    pass, and do not hard-code expected outputs. Follow both the spirit and
+    letter of these instructions — any such shortcut will be detected and
+    scored zero.
+
+    Keep changes minimal. A bug fix doesn't need surrounding cleanup or
+    refactoring; don't add features, abstractions, or error-handling beyond
+    what the task requires.
+
+    Prefer dedicated tools over Bash when one fits: Read for known paths,
+    Grep for content search, Glob for filename patterns, Edit/Write for
+    file modification. Reserve Bash for shell-only operations (running
+    tests, build commands, environment inspection).
+
+  instance_template: |
+    Fix the following issue:
+
+    {{task}}
+
+  step_limit: 500
+
+environment:
+  cwd: "/testbed"
+  timeout: 300
+  environment_class: kubernetes
+  node_selector: {}
+  cpu_request: "0.5"
+  memory_request: "1Gi"
+  cpu_limit: "4"
+  memory_limit: "8Gi"
+  env:
+    no_proxy: "localhost,127.0.0.1,.svc.cluster.local"
+    NO_PROXY: "localhost,127.0.0.1,.svc.cluster.local"
+  labels: {}
+  host_network: false
+  anti_hack_cleanup: true
+  raise_on_transport_error: true
+
+model:
+  model_name: policy
+  protocol: chat
+  model_kwargs:
+    temperature: 1.0

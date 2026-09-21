@@ -215,6 +215,7 @@ class ActorConfig(BaseConfig):
 
         valid_loss_agg_modes = [
             "token-mean",
+            "prompt-mean",
             "token-sum",
             "seq-mean-token-sum",
             "seq-mean-token-mean",
@@ -222,6 +223,8 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.loss_agg_mode == "prompt-mean" and self.policy_loss.get("loss_mode", "vanilla") != "vanilla":
+            raise ValueError("prompt-mean currently requires the vanilla PPO policy loss")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

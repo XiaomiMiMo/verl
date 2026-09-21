@@ -1,0 +1,18 @@
+- name: mimo_swe_agent
+  _target_: recipes.general.agent_loop.GeneralAgentLoop
+  mimoagent_config_path: config/agent/general/s3k.yaml
+
+  per_turn_max_tokens: 65536
+
+  reward_timeout: ${oc.env:REWARD_TIMEOUT,0}
+
+  env_setup_timeout: ${oc.env:ENV_SETUP_TIMEOUT,3600}
+
+  fail_on_env_setup_error: ${oc.env:FAIL_ON_ENV_SETUP_ERROR,false}
+
+  invalid_reward_for_infra: ${oc.env:INVALID_REWARD_FOR_INFRA,true}
+
+  trajectory_timeout: ${oc.env:TRAJECTORY_TIMEOUT,1200}
+
+  env_num_cpus: ${oc.env:ENV_NUM_CPUS,0.125}
+  agent_thread_pool_size: 64

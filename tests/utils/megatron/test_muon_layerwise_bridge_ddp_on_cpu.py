@@ -79,7 +79,7 @@ def megatron_bridge_stubs(monkeypatch):
     bridge_mod = types.ModuleType("megatron.bridge.training.utils.config_utils")
     bridge_mod.create_ddp_config = fake_create_ddp_config
     peft_mod = types.ModuleType("megatron.bridge.peft.utils")
-    peft_mod.create_peft_hook = lambda *args, **kwargs: (lambda model: model)
+    peft_mod.create_peft_hook = lambda *args, **kwargs: lambda model: model
     peft_mod.load_peft_adapter_checkpoint = lambda *args, **kwargs: None
 
     monkeypatch.setitem(sys.modules, "megatron.bridge.training.utils.config_utils", bridge_mod)
@@ -113,7 +113,7 @@ def megatron_bridge_stubs(monkeypatch):
     )
     bridge_helpers = types.ModuleType("verl.models.mcore.bridge")
     bridge_helpers.freeze_moe_router = lambda model: model
-    bridge_helpers.make_value_model = lambda *args, **kwargs: (lambda model: model)
+    bridge_helpers.make_value_model = lambda *args, **kwargs: lambda model: model
     monkeypatch.setitem(sys.modules, "verl.models.mcore.bridge", bridge_helpers)
 
     return {

@@ -130,4 +130,8 @@ ENV/
 logs
 log
 outputs
+# verl writes tensorboard to a cwd-relative tensorboard_log/<project>/<experiment> whenever
+# TENSORBOARD_DIR is unset (verl/utils/tracking.py:713), so any run with
+# trainer.logger=[...,"tensorboard"] grows this at the repo root.
+tensorboard_log
 .history

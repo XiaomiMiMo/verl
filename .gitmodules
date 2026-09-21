@@ -1,3 +1,9 @@
 [submodule "recipe"]
 	path = recipe
 	url = https://github.com/verl-project/verl-recipe.git
+[submodule "third_party/uni_agent"]
+	path = third_party/uni_agent
+	url = https://github.com/XiaomiMiMo/uni-agent.git
+[submodule "third_party/mimoagent-osr"]
+	path = third_party/mimoagent-osr
+	url = https://github.com/XiaomiMiMo/MiMo-Agent.git

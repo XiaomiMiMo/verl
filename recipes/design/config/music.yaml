@@ -1,0 +1,105 @@
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ???
+    use_fused_kernels: true
+
+  rollout:
+    name: sglang
+    mode: async
+    prompt_length: 16384
+    response_length: 100000
+    max_model_len: 116384
+    n: 8
+    tensor_model_parallel_size: 4
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    max_num_seqs: 128
+    load_format: auto
+    engine_kwargs:
+      sglang:
+        max_mamba_cache_size: 384
+        mamba_scheduler_strategy: no_buffer
+        log_level: error
+    multi_turn:
+      enable: false
+      format: qwen3_coder
+
+  actor:
+    use_dynamic_bsz: true
+    ppo_mini_batch_size: 32
+    ppo_max_token_len_per_gpu: 116384
+    clip_ratio: 0.2
+    entropy_coeff: 0
+    use_kl_loss: false
+    optim:
+      lr: 1e-6
+    megatron:
+      param_offload: true
+      grad_offload: true
+      optimizer_offload: true
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_mbridge: true
+      vanilla_mbridge: false
+      use_remove_padding: true
+      override_transformer_config:
+        recompute_granularity: full
+        recompute_method: uniform
+        recompute_num_layers: 1
+
+data:
+  train_files: ???
+  val_files: ???
+  prompt_key: prompt
+  train_batch_size: 32
+  max_prompt_length: 16384
+  max_response_length: 100000
+  filter_overlong_prompts: false
+  return_raw_chat: true
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  filter_groups:
+    enable: false
+    metric: reward
+    max_inflight_gen_batches: 2
+
+reward:
+  num_workers: 16
+  custom_reward_function:
+    path: pkg://recipes.design.music.scorer
+    name: compute_score
+
+trainer:
+  nnodes: 8
+  n_gpus_per_node: 8
+  total_epochs: 4
+  logger:
+    - console
+    - tensorboard
+  val_before_train: true
+  save_freq: 10
+  test_freq: 10
+  log_val_generations: 5
+  max_actor_ckpt_to_keep: 3
+  resume_mode: auto
+  v1:
+    trainer_mode: colocate_async
+    colocate_async:
+      num_warmup_batches: 1
+    sampler:
+      max_off_policy_threshold: 4
+      max_off_policy_strategy: drop

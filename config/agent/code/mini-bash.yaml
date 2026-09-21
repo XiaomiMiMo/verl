@@ -1,0 +1,38 @@
+use_dataset_env: true
+
+agent:
+  type: bashonly-agent
+  tools:
+    - tool: bash-only
+      config:
+        timeout: 60
+        max_timeout: 300
+  system_template: |
+    You are an agent, your current working directory is {{cwd}}.
+
+    You can use the tools available to you to interact with the computer to assist the user in completing tasks.
+  instance_template: |
+    Fix the following issue:
+
+    {{task}}
+  step_limit: 500
+
+environment:
+  cwd: "/testbed"
+  timeout: 300
+  environment_class: kubernetes
+  node_selector: {}
+  cpu_request: "0.5"
+  memory_request: "1Gi"
+  cpu_limit: "4"
+  memory_limit: "8Gi"
+  labels: {}
+  host_network: false
+  anti_hack_cleanup: true
+  raise_on_transport_error: true
+
+model:
+  model_name: policy
+  protocol: chat
+  model_kwargs:
+    temperature: 1.0

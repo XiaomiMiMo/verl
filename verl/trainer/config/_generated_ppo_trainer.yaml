@@ -301,6 +301,9 @@ actor_rollout_ref:
       _target_: verl.workers.config.SamplingConfig
       top_k: -1
       top_p: 1.0
+      min_p: 0.0
+      presence_penalty: 0.0
+      repetition_penalty: 1.0
       temperature: 0
       'n': 1
       do_sample: false
@@ -818,6 +821,7 @@ algorithm:
   pf_ppo:
     reweight_method: pow
     weight_pow: 2.0
+  invalid_reward_value: null
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false

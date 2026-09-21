@@ -206,6 +206,92 @@ def test_filter_groups_evicted_samples_are_summed_across_iterations():
     assert agg.get_aggregated_metrics()["training/filter_groups/evicted_samples"] == pytest.approx(5.0)
 
 
+def test_group_success_histogram_counts_sum_and_ratios_are_derived_after_sync():
+    agg = MetricsAggregator()
+    agg.add_step_metrics(
+        {
+            "training/filter_groups/group_count": 2,
+            "training/filter_groups/group_success_count/0": 1,
+            "training/filter_groups/group_success_count/1": 1,
+        },
+        sample_count=8,
+    )
+    agg.add_step_metrics(
+        {
+            "training/filter_groups/group_count": 2,
+            "training/filter_groups/group_success_count/1": 1,
+            "training/filter_groups/group_success_count/2": 1,
+        },
+        sample_count=8,
+    )
+
+    out = agg.get_aggregated_metrics()
+    assert out["training/filter_groups/group_count"] == pytest.approx(4.0)
+    assert out["training/filter_groups/group_success_count/0"] == pytest.approx(1.0)
+    assert out["training/filter_groups/group_success_count/1"] == pytest.approx(2.0)
+    assert out["training/filter_groups/group_success_count/2"] == pytest.approx(1.0)
+    assert out["training/filter_groups/group_success_ratio/0"] == pytest.approx(0.25)
+    assert out["training/filter_groups/group_success_ratio/1"] == pytest.approx(0.5)
+    assert out["training/filter_groups/group_success_ratio/2"] == pytest.approx(0.25)
+    assert "training/filter_groups/raw/avg@n" not in out
+
+
+def test_raw_avg_at_n_and_passrate_buckets_are_derived_after_sync():
+    agg = MetricsAggregator()
+    agg.add_step_metrics(
+        {
+            "training/filter_groups/group_count": 2,
+            "training/filter_groups/raw_group_passrate_sum": 0.5,
+            "training/filter_groups/raw_reward_sum": 1.0,
+            "training/filter_groups/raw_rollout_count": 4.0,
+            "training/filter_groups/raw_passrate_zero_count": 1.0,
+            "training/filter_groups/raw_passrate_one_count": 0.0,
+            "training/filter_groups/raw_passrate_mid_count": 1.0,
+            "training/filter_groups/raw_harness/cc-agent/group_count": 1.0,
+            "training/filter_groups/raw_harness/cc-agent/group_passrate_sum": 0.25,
+            "training/filter_groups/raw_harness/cc-agent/reward_sum": 1.0,
+            "training/filter_groups/raw_harness/cc-agent/rollout_count": 4.0,
+            "training/filter_groups/raw_harness/cc-agent/passrate_zero_count": 0.0,
+            "training/filter_groups/raw_harness/cc-agent/passrate_one_count": 0.0,
+            "training/filter_groups/raw_harness/cc-agent/passrate_mid_count": 1.0,
+        },
+        sample_count=8,
+    )
+    agg.add_step_metrics(
+        {
+            "training/filter_groups/group_count": 3,
+            "training/filter_groups/raw_group_passrate_sum": 2.5,
+            "training/filter_groups/raw_reward_sum": 10.0,
+            "training/filter_groups/raw_rollout_count": 12.0,
+            "training/filter_groups/raw_passrate_zero_count": 0.0,
+            "training/filter_groups/raw_passrate_one_count": 2.0,
+            "training/filter_groups/raw_passrate_mid_count": 1.0,
+            "training/filter_groups/raw_harness/cc-agent/group_count": 1.0,
+            "training/filter_groups/raw_harness/cc-agent/group_passrate_sum": 0.75,
+            "training/filter_groups/raw_harness/cc-agent/reward_sum": 3.0,
+            "training/filter_groups/raw_harness/cc-agent/rollout_count": 4.0,
+            "training/filter_groups/raw_harness/cc-agent/passrate_zero_count": 0.0,
+            "training/filter_groups/raw_harness/cc-agent/passrate_one_count": 0.0,
+            "training/filter_groups/raw_harness/cc-agent/passrate_mid_count": 1.0,
+        },
+        sample_count=12,
+    )
+
+    out = agg.get_aggregated_metrics()
+    assert out["training/filter_groups/raw/avg@n"] == pytest.approx(0.6)
+    assert out["training/filter_groups/raw/reward_mean"] == pytest.approx(11 / 16)
+    assert out["training/filter_groups/raw/rollout_count"] == pytest.approx(16.0)
+    assert out["training/filter_groups/raw/passrate/zero"] == pytest.approx(0.2)
+    assert out["training/filter_groups/raw/passrate/one"] == pytest.approx(0.4)
+    assert out["training/filter_groups/raw/passrate/mid"] == pytest.approx(0.4)
+    assert "training/filter_groups/raw_group_passrate_sum" not in out
+    assert out["training/filter_groups/raw/harness/cc-agent/group_count"] == 2.0
+    assert out["training/filter_groups/raw/harness/cc-agent/avg@n"] == pytest.approx(0.5)
+    assert out["training/filter_groups/raw/harness/cc-agent/reward_mean"] == pytest.approx(0.5)
+    assert out["training/filter_groups/raw/harness/cc-agent/passrate/mid"] == 1.0
+    assert "training/filter_groups/raw_harness/cc-agent/group_passrate_sum" not in out
+
+
 def test_filter_groups_discarded_surplus_samples_are_summed_across_iterations():
     agg = MetricsAggregator()
     agg.add_step_metrics({"training/filter_groups/discarded_surplus_samples": 4})

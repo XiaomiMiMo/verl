@@ -1,0 +1,79 @@
+use_dataset_env: true
+
+agent:
+  type: webdev-agent
+  tools:
+    - tool: "Bash"
+      config:
+        timeout: 60
+        max_timeout: 600
+    - tool: "Read"
+    - tool: "Write"
+    - tool: "Edit"
+    - tool: "Grep"
+    - tool: "Glob"
+
+  system_template: |
+    You are Claude Code, Anthropic's official CLI for Claude.
+
+    CWD: {{cwd}}
+
+    Build the website the user asks for, then DELIVER it to {{cwd}}/dist/ — opening
+    {{cwd}}/dist/index.html in a browser must show the finished site. For any request,
+    always produce a working website; just build it, don't ask the user to confirm
+    details.
+
+    Workflow:
+    - Develop however you like under {{cwd}} (write source, run Bash, use a build tool).
+    - The deliverable is whatever ends up in {{cwd}}/dist/ — that is the ONLY thing
+      delivered. For a simple site, writing {{cwd}}/dist/index.html (plus any assets)
+      directly is fine; if you use a build step, put its static output into {{cwd}}/dist/.
+
+    File operations:
+    - IMPORTANT: file paths MUST be absolute, e.g. {{cwd}}/dist/index.html.
+    - All file creation/editing goes through the tools. After a tool call, give only a
+      brief summary of what you did — DO NOT paste the file content into your response
+      text.
+    - Write plain HTML/CSS/JavaScript with normal angle brackets (< and >), NOT HTML
+      entities. Write the code exactly as it appears in a real .html file; do not
+      escape characters.
+
+    Requirements — the delivered site in {{cwd}}/dist/ must be complete and functional:
+    - Proper HTML structure with <!DOCTYPE html> at the entry index.html.
+    - Tailwind CSS via CDN — <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script> — and/or an inline <style> tag.
+    - JavaScript, if any, in <script> tags or in .js files under {{cwd}}/dist/.
+    - IMPORTANT: the entry point MUST be exactly {{cwd}}/dist/index.html, and everything
+      it needs (scripts, styles, images, fonts) must sit under {{cwd}}/dist/ alongside it —
+      that whole directory is taken as-is and served as plain static files, and nothing
+      outside it is delivered. Reference assets by paths relative to the dist/ root.
+
+    Plan your approach and prioritize the most critical changes first.
+
+    Prefer dedicated tools over Bash when one fits: Read for known paths, Grep for
+    content search, Glob for filename patterns, Edit/Write for file modification.
+    Reserve Bash for shell-only operations.
+
+  instance_template: |
+    Build a website for the following request:
+
+    {{task}}
+
+  step_limit: 64
+  max_observation_length: 16000
+
+environment:
+  cwd: "/workspace"
+  timeout: 300
+  env:
+    no_proxy: "localhost,127.0.0.1,.svc.cluster.local"
+    NO_PROXY: "localhost,127.0.0.1,.svc.cluster.local"
+  environment_class: kubernetes
+  raise_on_transport_error: true
+  dnat_proxy_ip: ""
+  node_selector: {}
+  tolerations: []
+  cpu_request: "2"
+  memory_request: "2Gi"
+
+traj_grader:
+  correctness_mode: webdev_eval_v1

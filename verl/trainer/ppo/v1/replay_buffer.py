@@ -31,6 +31,13 @@ VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DE
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 
 
+def _metric_component(value: object) -> str:
+    """Return a TensorBoard-safe path component for a harness name."""
+    text = str(value or "unknown").strip()
+    sanitized = "".join(char if char.isalnum() or char in "-._" else "_" for char in text)
+    return sanitized or "unknown"
+
+
 def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None:
     """Merge one poll iteration's eviction metrics into ``acc`` in place.
 
@@ -177,6 +184,7 @@ class ReplayBuffer:
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
+        self._dapo_group_metrics: dict[str, dict[str, float]] = defaultdict(dict)
 
     def _validate_mode_config(self) -> None:
         if self.filter_groups_metric is not None:
@@ -245,6 +253,21 @@ class ReplayBuffer:
             self.prompt_global_steps[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
 
+    @staticmethod
+    def _classify_group(metrics: list[tuple[float, float]]) -> float | None:
+        """``None`` if the group carries a gradient, else the metric value it collapsed to.
+
+        ``metrics`` is ``(metric_value, is_infra)`` per trajectory. Only the non-infra entries are
+        judged: see the comment at the call site for why judging the raw n is wrong. ``<=1`` valid
+        entries count as no-signal, because a singleton group has no within-group contrast either.
+        """
+        valid = [value for value, is_infra in metrics if is_infra < 0.5]
+        if not valid:
+            return 0.0
+        if len(valid) == 1 or float(np.std(valid)) == 0.0:
+            return float(valid[0])
+        return None
+
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
         """Finished groups whose configured DAPO metric is identical across all trajectories.
 
@@ -252,6 +275,7 @@ class ReplayBuffer:
         same scope, so the diagnostic (which reward level the no-signal groups collapse to) travels
         with the uids through the return value instead of via hidden instance state.
         """
+        self._dapo_group_metrics[partition_id] = {}
         if partition_id == "val" or self.filter_groups_metric is None:
             return set(), Counter()
 
@@ -263,26 +287,56 @@ class ReplayBuffer:
         new_finished_uids = finished_uids - classification_cache.keys()
         trajectory_keys = [key for key in self.partitions[partition_id] if key.split("_")[0] in new_finished_uids]
         metrics_by_uid: dict[str, list[float]] = defaultdict(list)
+        infra_by_uid: dict[str, list[float]] = defaultdict(list)
+        subgroup_values: dict[tuple[str, str], list[float]] = defaultdict(list)
         missing_metric_uids = new_finished_uids - {key.split("_")[0] for key in trajectory_keys}
 
         if trajectory_keys:
+            select_fields = ["extra_fields"]
+            if self.filter_groups_metric == "reward":
+                select_fields.append("rm_scores")
             data = tq.kv_batch_get(
                 keys=trajectory_keys,
                 partition_id=partition_id,
-                select_fields=["extra_fields"],
+                select_fields=select_fields,
             )
-            extra_fields_list = list(data["extra_fields"])
+            extra_fields_data = data.get("extra_fields")
+            extra_fields_list = list(extra_fields_data) if extra_fields_data is not None else []
+            rm_scores_list = list(data.get("rm_scores", []))
         else:
             extra_fields_list = []
+            rm_scores_list = []
 
-        for key, extra_fields in zip(trajectory_keys, extra_fields_list, strict=True):
+        for index, key in enumerate(trajectory_keys):
             uid = key.split("_")[0]
+            trajectory_tag = self.partitions[partition_id].get(key, {})
+            extra_fields = extra_fields_list[index] if index < len(extra_fields_list) else {}
             extra_fields = getattr(extra_fields, "data", extra_fields)
             reward_extra_info = extra_fields.get("reward_extra_info", {}) if isinstance(extra_fields, dict) else {}
-            if self.filter_groups_metric not in reward_extra_info:
+            metric_value = reward_extra_info.get(self.filter_groups_metric)
+            if metric_value is None and self.filter_groups_metric == "reward" and index < len(rm_scores_list):
+                score = getattr(rm_scores_list[index], "data", rm_scores_list[index])
+                if hasattr(score, "sum"):
+                    score = score.sum()
+                if hasattr(score, "item"):
+                    score = score.item()
+                metric_value = float(score)
+            if metric_value is None:
                 missing_metric_uids.add(uid)
             else:
-                metrics_by_uid[uid].append(float(reward_extra_info[self.filter_groups_metric]))
+                metric_value = float(metric_value)
+                metrics_by_uid[uid].append(metric_value)
+                infra_by_uid[uid].append(
+                    float(extra_fields.get("is_infra", 0.0)) if isinstance(extra_fields, dict) else 0.0
+                )
+                harness = (
+                    trajectory_tag.get("agent_type")
+                    or trajectory_tag.get("selected_harness")
+                    or reward_extra_info.get("agent_type")
+                    or reward_extra_info.get("selected_harness")
+                    or "unknown"
+                )
+                subgroup_values[(uid, _metric_component(harness))].append(metric_value)
 
         if missing_metric_uids:
             raise RuntimeError(
@@ -290,9 +344,84 @@ class ReplayBuffer:
                 f"{sorted(missing_metric_uids)[:5]}"
             )
 
+        group_success_counts: Counter[int] = Counter()
+        raw_passrate_bucket_counts: Counter[str] = Counter()
+        raw_group_passrate_sum = 0.0
+        raw_reward_sum = 0.0
+        raw_rollout_count = 0
+        harness_stats: dict[str, dict[str, float]] = {}
+        harness_passrate_buckets: dict[str, Counter[str]] = defaultdict(Counter)
+        max_group_size = 0
         for uid in new_finished_uids:
             values = metrics_by_uid[uid]
-            classification_cache[uid] = float(values[0]) if len(values) > 1 and float(np.std(values)) == 0.0 else None
+            classification_cache[uid] = self._classify_group(list(zip(values, infra_by_uid[uid], strict=True)))
+            success_count = sum(1 for value in values if value >= 0.5)
+            group_success_counts[success_count] += 1
+            max_group_size = max(max_group_size, len(values))
+
+            group_passrate = float(np.mean(values))
+            raw_group_passrate_sum += group_passrate
+            raw_reward_sum += float(sum(values))
+            raw_rollout_count += len(values)
+            if group_passrate == 0.0:
+                raw_passrate_bucket_counts["zero"] += 1
+            elif group_passrate == 1.0:
+                raw_passrate_bucket_counts["one"] += 1
+            else:
+                raw_passrate_bucket_counts["mid"] += 1
+
+        for (_uid, harness), values in subgroup_values.items():
+            stats = harness_stats.setdefault(
+                harness,
+                {
+                    "group_count": 0.0,
+                    "group_passrate_sum": 0.0,
+                    "reward_sum": 0.0,
+                    "rollout_count": 0.0,
+                },
+            )
+            group_passrate = float(np.mean(values))
+            stats["group_count"] += 1.0
+            stats["group_passrate_sum"] += group_passrate
+            stats["reward_sum"] += float(sum(values))
+            stats["rollout_count"] += float(len(values))
+            passrate_buckets = harness_passrate_buckets[harness]
+            if group_passrate == 0.0:
+                passrate_buckets["zero"] += 1
+            elif group_passrate == 1.0:
+                passrate_buckets["one"] += 1
+            else:
+                passrate_buckets["mid"] += 1
+
+        if new_finished_uids:
+            prefix = self._metrics_prefix(partition_id)
+            group_metrics = {
+                f"{prefix}/filter_groups/group_count": float(len(new_finished_uids)),
+                f"{prefix}/filter_groups/raw_group_passrate_sum": raw_group_passrate_sum,
+                f"{prefix}/filter_groups/raw_reward_sum": raw_reward_sum,
+                f"{prefix}/filter_groups/raw_rollout_count": float(raw_rollout_count),
+                f"{prefix}/filter_groups/raw_passrate_zero_count": float(raw_passrate_bucket_counts["zero"]),
+                f"{prefix}/filter_groups/raw_passrate_one_count": float(raw_passrate_bucket_counts["one"]),
+                f"{prefix}/filter_groups/raw_passrate_mid_count": float(raw_passrate_bucket_counts["mid"]),
+            }
+            for success_count in range(max_group_size + 1):
+                key = f"{prefix}/filter_groups/group_success_count/{success_count}"
+                group_metrics[key] = float(group_success_counts[success_count])
+            for harness, stats in sorted(harness_stats.items()):
+                harness_prefix = f"{prefix}/filter_groups/raw_harness/{harness}"
+                passrate_buckets = harness_passrate_buckets[harness]
+                group_metrics.update(
+                    {
+                        f"{harness_prefix}/group_count": float(stats["group_count"]),
+                        f"{harness_prefix}/group_passrate_sum": float(stats["group_passrate_sum"]),
+                        f"{harness_prefix}/reward_sum": float(stats["reward_sum"]),
+                        f"{harness_prefix}/rollout_count": float(stats["rollout_count"]),
+                        f"{harness_prefix}/passrate_zero_count": float(passrate_buckets["zero"]),
+                        f"{harness_prefix}/passrate_one_count": float(passrate_buckets["one"]),
+                        f"{harness_prefix}/passrate_mid_count": float(passrate_buckets["mid"]),
+                    }
+                )
+            self._dapo_group_metrics[partition_id] = group_metrics
 
         filtered_rewards = {uid: reward for uid, reward in classification_cache.items() if reward is not None}
         return set(filtered_rewards), Counter(filtered_rewards.values())
@@ -334,11 +463,11 @@ class ReplayBuffer:
         """Evict terminal groups selected by any active policy exactly once."""
         stale_uids, dapo_uids, failed_uids, dapo_counts = eviction_reasons
         evicted_uids = stale_uids | dapo_uids | failed_uids
-        if not evicted_uids:
+        metrics = self._dapo_group_metrics.pop(partition_id, {})
+        if not evicted_uids and not metrics:
             return set(), 0, 0, {}
 
         prefix = self._metrics_prefix(partition_id)
-        metrics: dict = {}
         if stale_uids:
             prompt_global_steps = self.prompt_global_steps[partition_id]
             spans = np.array(
@@ -438,7 +567,7 @@ class ReplayBuffer:
             evicted_uids, stale_count, dapo_count, metrics = self._evict_terminal_groups(
                 global_steps, partition_id, eviction_reasons
             )
-            if evicted_uids:
+            if metrics:
                 _accumulate_eviction_metrics(eviction_metrics, metrics, stale_count)
 
             sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
@@ -552,8 +681,10 @@ class ReplayBufferAsync(ReplayBuffer):
             evicted_uids, stale_count, _dapo_count, metrics = self._evict_terminal_groups(
                 global_steps, partition_id, eviction_reasons
             )
-            if evicted_uids:
+            if metrics:
                 _accumulate_eviction_metrics(eviction_metrics, metrics, stale_count)
+
+            if evicted_uids:
                 if self.refill_fn is not None:
                     self.refill_fn(len(evicted_uids))
                 continue

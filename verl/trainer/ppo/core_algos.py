@@ -303,6 +303,26 @@ def compute_grpo_outcome_advantage(
     """
     scores = token_level_rewards.sum(dim=-1)
 
+    invalid_reward_value = getattr(config, "invalid_reward_value", None) if config is not None else None
+    invalid_mask = None
+    if invalid_reward_value is not None:
+        invalid_mask = scores == invalid_reward_value
+        if bool(invalid_mask.any()):
+            valid_by_uid: dict[Any, list] = defaultdict(list)
+            for i in range(scores.shape[0]):
+                if not bool(invalid_mask[i]):
+                    valid_by_uid[index[i]].append(scores[i])
+            for i in range(scores.shape[0]):
+                if bool(invalid_mask[i]):
+                    group = valid_by_uid.get(index[i]) or []
+                    scores[i] = (
+                        torch.stack(group).mean()
+                        if group
+                        else torch.zeros((), dtype=scores.dtype, device=scores.device)
+                    )
+        else:
+            invalid_mask = None
+
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
@@ -326,6 +346,8 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+        if invalid_mask is not None:
+            scores[invalid_mask] = 0.0
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -1135,6 +1157,31 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
+def compute_prompt_loss_weights(loss_mask: torch.Tensor, prompt_ids) -> torch.Tensor:
+    """Return 1 / (active prompt count * prompt action tokens) for every row.
+
+    Compute once over the complete optimizer batch before DP/microbatch splits.
+    Zero-token prompts (including synthetic padding) do not enter the average.
+    """
+    if loss_mask.ndim != 2 or len(prompt_ids) != loss_mask.shape[0]:
+        raise ValueError("Prompt IDs must match the rows of a two-dimensional loss mask")
+    lengths = loss_mask.to(torch.bool).sum(dim=-1).tolist()
+    totals: defaultdict[Any, int] = defaultdict(int)
+    for prompt_id, length in zip(prompt_ids, lengths, strict=True):
+        totals[prompt_id] += length
+    prompt_count = sum(total > 0 for total in totals.values())
+    if prompt_count == 0:
+        raise ValueError("prompt-mean requires at least one prompt with action tokens")
+    return torch.tensor(
+        [
+            1.0 / (prompt_count * totals[uid]) if length else 0.0
+            for uid, length in zip(prompt_ids, lengths, strict=True)
+        ],
+        dtype=torch.float64,
+        device=loss_mask.device,
+    )
+
+
 def agg_loss(
     loss_mat: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -1143,6 +1190,7 @@ def agg_loss(
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
+    prompt_loss_weights: Optional[torch.Tensor] = None,
 ):
     """
     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
@@ -1160,12 +1208,18 @@ def agg_loss(
         global_batch_size: global batch size
         loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
             Set this to a constant value to ensure consistent normalization throughout training.
+        prompt_loss_weights: Global prompt normalization weights for the local rows.
 
     Returns:
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
-    if loss_agg_mode == "token-mean":
+    if loss_agg_mode == "prompt-mean":
+        if prompt_loss_weights is None or prompt_loss_weights.shape != (loss_mat.shape[0],):
+            raise ValueError("prompt-mean requires global prompt_loss_weights for every local row")
+        weights = prompt_loss_weights.to(device=loss_mat.device, dtype=loss_mat.dtype)
+        loss = verl_F.masked_sum(loss_mat * weights.unsqueeze(-1), loss_mask) * dp_size
+    elif loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")

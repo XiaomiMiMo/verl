@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+
+# chrome dumps core under render load; 5GB and never a deliverable
+core.*

@@ -1,0 +1,45 @@
+# Network and read-only tooling trusted by the user.
+prefix_rule(
+    pattern = ["curl"],
+    decision = "allow",
+    justification = "The user explicitly trusts curl for network requests.",
+)
+
+prefix_rule(
+    pattern = ["wget"],
+    decision = "allow",
+    justification = "The user explicitly trusts wget for network requests.",
+)
+
+prefix_rule(pattern = ["ls"], decision = "allow")
+prefix_rule(pattern = ["cat"], decision = "allow")
+prefix_rule(pattern = ["sed"], decision = "allow")
+prefix_rule(pattern = ["rg"], decision = "allow")
+prefix_rule(pattern = ["git", "status"], decision = "allow")
+prefix_rule(pattern = ["git", "diff"], decision = "allow")
+prefix_rule(pattern = ["git", "log"], decision = "allow")
+prefix_rule(pattern = ["gh", "issue", "view"], decision = "allow")
+prefix_rule(pattern = ["gh", "pr", "view"], decision = "allow")
+
+# High-risk operations are always blocked.
+prefix_rule(
+    pattern = ["git", "push", "--force"],
+    decision = "forbidden",
+    justification = "Force-pushing is disabled.",
+)
+prefix_rule(
+    pattern = ["rm", "-rf"],
+    decision = "forbidden",
+    justification = "Recursive force deletion is disabled.",
+)
+prefix_rule(pattern = ["killall"], decision = "forbidden")
+prefix_rule(pattern = ["shutdown"], decision = "forbidden")
+prefix_rule(pattern = ["reboot"], decision = "forbidden")
+prefix_rule(
+    pattern = ["gh", "pr", ["merge", "close"]],
+    decision = "forbidden",
+)
+prefix_rule(
+    pattern = ["gh", "issue", "close"],
+    decision = "forbidden",
+)

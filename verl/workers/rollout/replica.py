@@ -255,9 +255,8 @@ class RolloutReplica(ABC):
 
     @property
     def max_concurrency(self) -> int:
-        # 1000 is Ray's default max_concurrency for async execution.
-        # Add some margin to account for control method call.
-        return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
+        max_num_seqs = int(self.config.max_num_seqs or 1)
+        return max(2, max_num_seqs + CONTROL_METHOD_CONCURRENCY)
 
     def rollout_worker_use_gpu(self) -> bool:
         return True

@@ -1,0 +1,221 @@
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ???
+
+  rollout:
+    name: sglang
+    mode: async
+    nnodes: 0
+    n_gpus_per_node: 8
+    prompt_length: 8192
+    response_length: 253952
+    max_model_len: 262144
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    do_sample: true
+    load_format: auto
+    n: 16
+    tensor_model_parallel_size: 4
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    max_num_seqs: 512
+    log_prob_max_token_len_per_gpu: 131072
+    prometheus:
+      enable: true
+    disable_log_stats: false
+    engine_kwargs:
+      sglang:
+        kv_cache_dtype: fp8_e4m3
+        attention_backend: flashinfer
+        chunked_prefill_size: 32768
+        max_prefill_tokens: 32768
+        mamba_scheduler_strategy: extra_buffer
+        enable_metrics_for_all_schedulers: true
+        log_level: error
+    calculate_log_probs: true
+    enable_sleep_mode: true
+    free_cache_engine: true
+    log_prob_micro_batch_size_per_gpu: 1
+    val_kwargs:
+      n: 1
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20
+      do_sample: false
+    multi_turn:
+      enable: true
+      max_parallel_calls: 1
+      format: qwen3_coder
+    agent:
+      num_workers: 4
+      agent_loop_manager_class: uni_agent.framework.entry.AgentFrameworkRolloutAdapter
+    custom:
+      agent_framework:
+        gateway_count: 1
+        log_dir: ${oc.env:UNI_AGENT_LOG_DIR,/tmp/uni_agent_logs}
+        mask_unfinished_episode: false
+        ship_turn_index: false
+        repetition_detect:
+          enable: false
+          ngram_size: 300
+          window_size: 8300
+          min_content_length: 16384
+          min_repeat: 15
+          zero_reward: false
+        agent_runners:
+          mimoagent:
+            runner_fqn: recipes.code.mimoagent_runner.mimoagent_runner
+            dispatch_mode: ray_task
+            max_concurrent_sessions: 8
+            trajectory_selection: longest
+            session_timeout_seconds: ${oc.env:TRAJECTORY_TIMEOUT,7200}
+            agent_request_idle_timeout_seconds: ${oc.env:AGENT_REQUEST_IDLE_TIMEOUT,720}
+            trajectory_timeout_by_dataset: {}
+
+  actor:
+    use_dynamic_bsz: true
+    use_rollout_log_probs: true
+    ppo_mini_batch_size: 8
+    ppo_max_token_len_per_gpu: 131072
+    use_kl_loss: false
+    kl_loss_coef: 0.001
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    clip_ratio_c: 3.0
+    loss_agg_mode: prompt-mean
+    entropy_coeff: 0
+    entropy_from_logits_with_chunking: true
+    entropy_from_logits_chunk_size: 16384
+    ppo_micro_batch_size_per_gpu: 1
+    optim:
+      lr: 1e-6
+      weight_decay: 0.01
+      lr_decay_style: constant
+    megatron:
+      param_offload: true
+      grad_offload: true
+      optimizer_offload: true
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 2
+      expert_model_parallel_size: 1
+      use_mbridge: true
+      vanilla_mbridge: false
+      use_remove_padding: false
+      override_transformer_config:
+        recompute_granularity: full
+        recompute_method: uniform
+        recompute_num_layers: 1
+        attention_backend: auto
+
+  ref:
+    log_prob_max_token_len_per_gpu: 131072
+    megatron:
+      param_offload: true
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 2
+
+data:
+  train_files: ???
+  val_files: ???
+  prompt_key: prompt
+  truncation: error
+  max_prompt_length: 8192
+  max_response_length: 253952
+  train_batch_size: 32
+  val_batch_size: null
+  gen_batch_size: 1
+  return_raw_chat: true
+  trust_remote_code: false
+  dataloader_num_workers: 8
+  filter_overlong_prompts: false
+  apply_chat_template_kwargs: {}
+  custom_cls:
+    path: pkg://recipes.code.dataset
+    name: MimoAgentSWEDataset
+
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  group_advantage_by_harness: false
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+  filter_groups:
+    enable: true
+    metric: reward
+    max_inflight_gen_batches: 2
+  tool_call_error_penalty:
+    enable: false
+    strategy: monitor
+    penalty_value: 0.0
+  repetition_penalty:
+    enable: false
+    strategy: monitor
+    penalty_value: 0.0
+  deep_failure_mask:
+    enable: false
+    strategy: mask_failure
+    alpha: 1.0
+  signed_min_scale: 0.5
+  signed_max_scale: 2.0
+  rollout_correction:
+    bypass_mode: false
+
+reward:
+  custom_reward_function:
+    path: pkg://recipes.code.reward
+    name: compute_score
+
+trainer:
+  nnodes: 4
+  n_gpus_per_node: 8
+  total_epochs: 6
+  total_training_steps: 200
+  project_name: opensource-code
+  experiment_name: four-whitebox
+  logger:
+    - console
+  device: cuda
+  val_before_train: false
+  val_only: false
+  save_freq: 5
+  test_freq: -1
+  log_val_generations: 5
+  default_local_dir: outputs/four-whitebox/ckpt
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  resume_mode: disable
+  use_v1: true
+  v1:
+    trainer_mode: colocate_async
+    colocate_async:
+      num_warmup_batches: 1
+    sampler:
+      max_off_policy_threshold: 2
+      max_off_policy_strategy: drop
+
+transfer_queue:
+  enable: true
+
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        TRANSFER_QUEUE_ENABLE: ""

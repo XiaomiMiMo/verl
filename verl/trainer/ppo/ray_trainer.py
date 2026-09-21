@@ -184,6 +184,35 @@ def compute_spec_decode_metrics(
     }
 
 
+def extract_spec_decode_stats(spec_data):
+    """Extract optional per-request speculative decoding counters.
+
+    Some rollout adapters, including external agent harnesses, do not persist
+    ``extra_fields`` in TransferQueue.  Speculative decoding metrics are
+    auxiliary, so their absence must not fail an otherwise completed training
+    step.  Return an all-``None`` tuple for missing or incomplete metadata;
+    ``compute_spec_decode_metrics`` treats that tuple as a no-op.
+    """
+    if spec_data is None or "extra_fields" not in spec_data.keys():
+        return None, None, None
+
+    raw_extra_fields = spec_data["extra_fields"]
+    extra_fields = raw_extra_fields.tolist() if hasattr(raw_extra_fields, "tolist") else list(raw_extra_fields)
+    required_fields = (
+        "spec_num_draft_tokens",
+        "spec_num_accepted_tokens",
+        "spec_num_verify_steps",
+    )
+    if any(not isinstance(item, dict) or any(field not in item for field in required_fields) for item in extra_fields):
+        return None, None, None
+
+    return (
+        [item["spec_num_draft_tokens"] for item in extra_fields],
+        [item["spec_num_accepted_tokens"] for item in extra_fields],
+        [item["spec_num_verify_steps"] for item in extra_fields],
+    )
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,

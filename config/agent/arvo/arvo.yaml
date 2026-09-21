@@ -1,0 +1,44 @@
+
+use_dataset_env: true
+
+agent:
+  tools:
+  - tool: bash
+    config:
+      timeout: 300
+      max_timeout: 300
+  - tool: read
+    config: {}
+  - tool: write
+    config: {}
+  - tool: edit
+    config: {}
+  system_template: |
+    You are a security researcher. Your working directory is {{cwd}}.
+    You can use bash, read, write, and edit tools to interact with the system.
+  instance_template: |
+    {{task}}
+  step_limit: 300
+  disable_nudge: true
+  max_observation_length: 4000
+
+environment:
+  environment_class: kubernetes
+  cwd: /home/agent
+  timeout: 300
+  exec_user: agent
+  max_exec_budget: 1200
+  raise_on_transport_error: true
+  skip_precheck: true
+  anti_hack_cleanup: false
+  cpu_request: "0.1"
+  cpu_limit: "4"
+  memory_request: 512Mi
+  memory_limit: 8Gi
+  pod_timeout: 5h
+  host_network: false
+  capabilities: []
+  tolerations:
+    - key: "dedicated"
+      operator: "Exists"
+      effect: "NoSchedule"

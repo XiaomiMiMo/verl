@@ -1,0 +1,9 @@
+harnesses:
+  - label: mini-mimocode
+    config: ./mini-mimocode.yaml
+  - label: mini-bash
+    config: ./mini-bash.yaml
+  - label: mini-claude-code
+    config: ./mini-claude-code.yaml
+  - label: mini-codex
+    config: ./mini-codex.yaml

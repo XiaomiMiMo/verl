@@ -759,12 +759,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         set_expandable_segments(False)
         aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage("Before resume weights", logger=logger)
+        log_gpu_memory_usage("Before resume weights", logger=logger, level=logging.WARNING)
 
         # 1. resume rollout memory (weights were released during sleep)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+        log_gpu_memory_usage("After resume weights", logger=logger, level=logging.WARNING)
 
         # 2. determine if we need a base weight sync (adapter path only)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
@@ -789,8 +789,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
         )
 
-        log_gpu_memory_usage("After update_weights", logger=logger)
-
+        log_gpu_memory_usage("After update_weights", logger=logger, level=logging.WARNING)
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
@@ -799,7 +798,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
-        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+        log_gpu_memory_usage("After resume kv_cache", logger=logger, level=logging.WARNING)
 
         self.base_sync_done = True
         set_expandable_segments(True)

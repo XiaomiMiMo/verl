@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Design Grader</title>
+<style>
+  :root { --bd:#e3e6ea; --mut:#6b7280; --bg:#f7f8fa; --accent:#4f46e5; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; color:#1f2329; background:var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--bd); position:sticky; top:0; z-index:5; }
+  .row { display:flex; align-items:center; gap:14px; padding:7px 14px; flex-wrap:wrap; }
+  .row + .row { border-top:1px solid #f0f1f3; padding-top:6px; padding-bottom:6px; }
+  header h1 { font-size:14px; margin:0; font-weight:600; }
+  header .sp { flex:1; }
+  #meta { color:var(--mut); font-size:12px; }
+  .kpi { display:flex; gap:4px; align-items:baseline; }
+  .kpi b { font-size:15px; font-variant-numeric:tabular-nums; }
+  .kpi span { color:var(--mut); font-size:11px; }
+  .dist { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--mut); }
+  .dist .lbl { min-width:52px; text-align:right; }
+  .bar { display:flex; height:14px; width:280px; border-radius:3px; overflow:hidden; background:#f0f1f3; }
+  .bar i { display:block; height:100%; }
+  .keys { display:flex; gap:8px; font-size:11px; }
+  .keys em { font-style:normal; display:inline-flex; align-items:center; gap:3px; }
+  .keys em::before { content:''; width:8px; height:8px; border-radius:2px; background:currentColor; }
+  .wrap { display:flex; height:calc(100vh - 86px); }
+  #list { width:520px; overflow-y:auto; border-right:1px solid var(--bd); background:#fff; }
+  .item { padding:8px 12px; border-bottom:1px solid #f0f1f3; cursor:pointer; display:flex; gap:10px; align-items:center; }
+  .item:hover { background:#f7f8fa; }
+  .item.sel { background:#eef0fe; border-left:3px solid var(--accent); padding-left:9px; }
+  .thumb { width:96px; height:60px; object-fit:cover; object-position:top; border:1px solid var(--bd); border-radius:4px; background:#fafbfc; flex:none; }
+  .nothumb { display:flex; align-items:center; justify-content:center; color:var(--mut); font-size:10px; }
+  .item .mid { flex:1; min-width:0; }
+  .item .q { color:#374151; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .item .sub { color:var(--mut); font-size:11px; font-variant-numeric:tabular-nums; }
+  .badge { font-size:11px; padding:1px 8px; border-radius:9px; font-weight:700; white-space:nowrap; flex:none; font-variant-numeric:tabular-nums; }
+  /* outcome colours: green = earned, amber/red = a gate said no, grey = nothing there */
+  .r1   { background:#dcfce7; color:#15803d; }
+  .r05  { background:#d1fae5; color:#047857; }
+  .r025 { background:#fef3c7; color:#92400e; }
+  .r0   { background:#f3f4f6; color:#6b7280; }
+  .fitbad { background:#ffedd5; color:#c2410c; }
+  .laybad { background:#fde8e8; color:#b91c1c; }
+  .drop { background:#ede9fe; color:#6d28d9; }
+  .nodel { background:#f3f4f6; color:#9ca3af; }
+  #detail { flex:1; overflow-y:auto; padding:14px; }
+  #detail .ph { color:var(--mut); text-align:center; margin-top:80px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:12px; margin-bottom:12px; }
+  .card h3 { margin:0 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); font-weight:600; }
+  .shot { width:100%; max-width:1100px; border:1px solid var(--bd); border-radius:6px; display:block; }
+  .reason, .query { white-space:pre-wrap; color:#374151; }
+  .gate { display:flex; gap:8px; align-items:baseline; padding:5px 0; border-top:1px solid #f0f1f3; }
+  .gate:first-of-type { border-top:0; }
+  .gate .g { width:66px; flex:none; font-weight:600; font-size:12px; }
+  .gate .v { width:34px; flex:none; font-weight:700; font-variant-numeric:tabular-nums; }
+  .gate .t { color:#374151; font-size:12px; min-width:0; }
+  .ok { color:#15803d; } .bad { color:#b91c1c; } .mid { color:#92400e; }
+  .meta { color:var(--mut); font-size:12px; }
+  pre { background:#fafbfc; border:1px solid var(--bd); border-radius:6px; padding:8px; font-size:11px; overflow-x:auto; white-space:pre-wrap; word-break:break-word; }
+  details summary { cursor:pointer; color:var(--mut); font-size:12px; margin-bottom:6px; }
+  #pause { cursor:pointer; user-select:none; color:var(--mut); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>Design Grader</h1>
+    <span id="meta"></span>
+    <span class="sp"></span>
+    <span class="kpi"><b id="k-total">–</b><span>total</span></span>
+    <span class="kpi"><b id="k-pass">–</b><span>pass</span></span>
+    <span class="kpi"><b id="k-zero">–</b><span>零分</span></span>
+    <span class="kpi"><b id="k-drop">–</b><span>drop</span></span>
+    <span class="kpi"><b id="k-rej">–</b><span>503</span></span>
+    <span class="kpi" title="判完了但客户端已经关连接 — 判分白干，且客户端多半正在重试"><b id="k-gone">–</b><span>白干</span></span>
+    <span class="kpi"><b id="k-nodel">–</b><span>未交付</span></span>
+    <span class="kpi"><b id="k-unrender">–</b><span>无法渲染</span></span>
+    <span class="kpi" title="渲染判分都成功，但页面 JS 是死的 — runtime 门会把它归零"><b id="k-broken">–</b><span>JS 坏</span></span>
+    <span class="kpi" id="k-health-wrap"><b id="k-health">–</b><span>chrome/thr</span></span>
+    <span class="kpi" id="k-judge-wrap" title="router 在飞 / 自适应上限 · 排队中"><b id="k-judge">–</b><span>judge</span></span>
+    <span class="kpi" id="k-cpu-wrap" title="整机 CPU 忙碌比例 · 渲染在飞/上限"><b id="k-cpu">–</b><span>cpu · render</span></span>
+    <label id="pause"><input type="checkbox" id="auto" checked> auto 3s</label>
+  </div>
+  <div class="row">
+    <div class="dist"><span class="lbl">判分结果</span>
+      <span class="bar" id="b-reward"></span>
+      <span class="keys" id="l-reward"></span></div>
+    <div class="dist"><span class="lbl">需求覆盖 query</span>
+      <span class="bar" id="b-query"></span>
+      <span class="keys" id="l-query"></span></div>
+  </div>
+</header>
+<div class="wrap">
+  <div id="list"></div>
+  <div id="detail"><div class="ph">← 等待判分请求</div></div>
+</div>
+<script>
+let ITEMS = [], SEL = null, _busy = false, _seen = null;
+const $ = s => document.querySelector(s);
+const esc = s => (s==null?'':String(s)).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const hhmmss = ts => new Date(ts*1000).toLocaleTimeString('en-GB');
+
+/* ---- outcome classification ----------------------------------------------
+   There is no per-rollout reward to show. This service judges one rollout in
+   isolation; the reward is a RANK the driver computes once every sibling in the
+   group has been graded (POST /grade_group), so `reward` is null on every
+   record here and bucketing it would paint a healthy run entirely grey.
+
+   So the badge reports what this half actually produced — the query score —
+   and keeps the four non-score outcomes apart, because they have four
+   different fixes: nobody delivered, the renderer never got a page, the page
+   rendered but its JS is dead (the runtime gate, {0,1}), and a drop. */
+function gate(it) {
+  if (it.status !== 'ok') return 'drop';
+  if (it.no_delivery) return 'nodel';
+  if ((it.signals || {}).unrenderable) return 'unrender';
+  if ((((it.dims || {}).runtime) || {}).factor === 0) return 'broken';
+  const q = it.query_score ?? 0;
+  if (q >= 0.8) return 'rhigh';
+  if (q >= 0.5) return 'rmid';
+  if (q > 0) return 'rlow';
+  return 'r0';
+}
+function label(it) {
+  if (it.status !== 'ok') return 'drop';
+  if (it.no_delivery) return '未交付';
+  if ((it.signals || {}).unrenderable) return '无法渲染';
+  if ((((it.dims || {}).runtime) || {}).factor === 0) return 'JS 坏';
+  const q = it.query_score ?? 0;
+  // toFixed only where it matters: JSON 1.0 arrives as JS 1 and String() would
+  // drop the decimal, disagreeing with the legend.
+  return q > 0 ? (Number.isInteger(q) ? q.toFixed(1) : String(q)) : '0';
+}
+
+/* ---- distribution bars ---------------------------------------------------
+   Both bars are over the visible window. BUCKETED because the score is
+   continuous — a bar of 300 distinct values reads as noise. */
+const COLS = { r0:'#9ca3af', rlow:'#f59e0b', rmid:'#10b981', rhigh:'#15803d',
+               drop:'#dc2626', nodel:'#78716c', unrender:'#a855f7', broken:'#be185d',
+               q0:'#dc2626', q1:'#f59e0b', q2:'#10b981', q3:'#15803d' };
+const RW_LBL = { r0:'0', rlow:'(0,0.5)', rmid:'[0.5,0.8)', rhigh:'≥0.8',
+                 drop:'drop', nodel:'未交付', unrender:'无法渲染', broken:'JS 坏' };
+function bar(el, legEl, parts, legend) {
+  const tot = parts.reduce((a, p) => a + p[1], 0) || 1;
+  el.innerHTML = parts.filter(p => p[1] > 0)
+    .map(p => `<i style="width:${(p[1]/tot*100).toFixed(2)}%;background:${p[2]}"></i>`).join('');
+  legEl.innerHTML = legend(parts, tot);
+}
+function counts(items, f) {
+  const c = {};
+  for (const it of items) { const k = f(it); if (k != null) c[k] = (c[k] || 0) + 1; }
+  return c;
+}
+
+async function load() {
+  if (_busy) return;                    // a poll is still in flight — never stack them
+  _busy = true;
+  try {
+    const d = await (await fetch('api/recent?limit=300', {cache:'no-store'})).json();
+    ITEMS = d.items;
+    const s = d.stats;
+    $('#k-total').textContent   = s.total ?? '–';
+    $('#k-pass').textContent    = s.pass ?? '–';
+    $('#k-zero').textContent    = s.zero ?? '–';
+    $('#k-drop').textContent    = s.drop ?? '–';
+    $('#k-rej').textContent     = s.rejected ?? '–';
+    $('#k-gone').textContent    = s.client_gone ?? '–';
+    $('#k-nodel').textContent   = s.no_delivery ?? '–';
+    $('#k-unrender').textContent = s.unrenderable ?? '–';
+    $('#k-broken').textContent  = s.broken ?? '–';
+    $('#meta').textContent =
+      `${d.version || ''} · ${d.model || ''} · up ${Math.floor((s.uptime_s||0)/60)}m · 窗口 ${ITEMS.length}`;
+
+    // score bands over the window, including the four zero-shaped outcomes —
+    // a 0 the judge gave and a 0 from "nobody delivered it" need different fixes
+    const rw = counts(ITEMS, it => gate(it));
+    bar($('#b-reward'), $('#l-reward'),
+        [['rhigh', rw.rhigh||0, COLS.rhigh], ['rmid', rw.rmid||0, COLS.rmid],
+         ['rlow', rw.rlow||0, COLS.rlow], ['r0', rw.r0||0, COLS.r0],
+         ['nodel', rw.nodel||0, COLS.nodel], ['unrender', rw.unrender||0, COLS.unrender],
+         ['broken', rw.broken||0, COLS.broken], ['drop', rw.drop||0, COLS.drop]],
+        ps => ps.map(p => `<em style="color:${p[2]}">${RW_LBL[p[0]]}×${p[1]}</em>`).join(''));
+
+    // The query score is this half's only judged axis: if it saturates at 1.0
+    // the prompt is too loose and the reward loses one of its three inputs
+    const qb = [0,0,0,0];
+    for (const it of ITEMS) {
+      const q = it.query_score;
+      if (typeof q !== 'number') continue;
+      qb[q >= 0.8 ? 3 : q >= 0.5 ? 2 : q > 0 ? 1 : 0]++;
+    }
+    bar($('#b-query'), $('#l-query'),
+        [['q3', qb[3], COLS.q3], ['q2', qb[2], COLS.q2],
+         ['q1', qb[1], COLS.q1], ['q0', qb[0], COLS.q0]],
+        ps => ps.map((p, i) => `<em style="color:${p[2]}">${['0','(0,.5)','[.5,.8)','≥.8'][i]}×${p[1]}</em>`).join(''));
+
+    try {
+      const h = await (await fetch('healthz', {cache:'no-store'})).json();
+      $('#k-health').textContent = `${h.chrome}/${h.threads}`;
+      $('#k-health-wrap').style.color = h.ok ? '' : '#c0392b';
+      $('#k-health-wrap').style.fontWeight = h.ok ? '' : '700';
+      $('#k-health-wrap').title = h.ok
+        ? `chrome-headless ${h.chrome} ≤ ${h.chrome_max}, threads ${h.threads} ≤ ${h.threads_max}`
+        : `PRESSURE: chrome ${h.chrome}/${h.chrome_max}, threads ${h.threads}/${h.threads_max}`;
+      // the two bounds that used to be invisible: how many calls the router is
+      // being asked to hold (and how many wait behind that), and whether the
+      // box has CPU left for the renders it is running
+      const j = h.judge || {};
+      $('#k-judge').textContent = `${j.inflight ?? '?'}/${j.limit ?? '?'}` + (j.waiting ? ` +${j.waiting}` : '');
+      $('#k-judge-wrap').style.color = (j.waiting || 0) > 0 ? '#b9770e' : '';
+      const w = j.window || {};
+      $('#k-judge-wrap').title = `router 在飞 ${j.inflight} / 上限 ${j.limit}（自适应，已调 ${j.decisions} 次）· 排队 ${j.waiting} · 排队超预算放弃 ${j.gave_up}`
+        + (w.p50 != null ? ` · 上一窗口 p50 ${w.p50.toFixed(0)}s p90 ${w.p90.toFixed(0)}s 超时 ${(w.timeouts*100).toFixed(1)}%` : '');
+      const busy = h.cpu_busy == null ? '?' : Math.round(h.cpu_busy * 100) + '%';
+      $('#k-cpu').textContent = `${busy} · ${h.render_inflight ?? '?'}/${h.render_max ?? '?'}`;
+      $('#k-cpu-wrap').style.color = (h.cpu_busy || 0) > 0.9 ? '#c0392b' : '';
+    } catch (e) { $('#k-health').textContent = '?'; }
+
+    // only rebuild the list when something new actually arrived — otherwise the
+    // 3s poll just rewrites 300 nodes, jumps the scroll position and reads as a hang
+    const head = ITEMS[0] && ITEMS[0]._id;
+    if (head !== _seen) { _seen = head; render(); }
+  } catch (e) {
+    $('#meta').textContent = `fetch failed: ${String(e).slice(0, 80)}`;
+  } finally {
+    _busy = false;
+  }
+}
+
+function render() {
+  const sc = $('#list').scrollTop;
+  $('#list').innerHTML = ITEMS.map(it => `
+    <div class="item ${it._id===SEL?'sel':''}" data-id="${it._id}">
+      ${it.has_shot ? `<img class="thumb" loading="lazy" src="api/shot/${it._id}">`
+                    : `<div class="thumb nothumb">no shot</div>`}
+      <div class="mid">
+        <div class="q">${esc(it.query)||'<i>(no query)</i>'}</div>
+        <div class="sub">${hhmmss(it.ts)} · ${(it.task_id||'').slice(0,22)} · ${(it.timing||{}).total_s ?? '–'}s</div>
+      </div>
+      <span class="badge ${gate(it)}">${label(it)}</span>
+    </div>`).join('');
+  $('#list').scrollTop = sc;
+  document.querySelectorAll('.item').forEach(el => el.onclick = () => select(el.dataset.id));
+}
+
+function chip(v, okText, cls) {
+  return `<span class="v ${cls}">${v}</span>`;
+}
+
+async function select(id) {
+  SEL = id; render();
+  const it = ITEMS.find(x => x._id === id);
+  if (!it) return;
+  const t = it.timing || {}, s = it.signals || {};
+  const dm = it.dims || {};
+  const nq = dm.query || {};
+  const noVerdict = (o, why) => o && Object.keys(o).length ? '' :
+    `<i style="color:var(--mut)">${why || '未取得判决（整条已 drop）'}</i>`;
+  const qScore = nq.query_score ?? '–';
+  const qWhy   = nq.reason || '';
+  $('#detail').innerHTML = `
+    <div class="card"><h3>Verdict</h3>
+      <div style="display:flex;gap:10px;align-items:baseline;margin-bottom:8px;flex-wrap:wrap">
+        <span class="badge ${gate(it)}" style="font-size:14px">${label(it)}</span>
+        <b style="font-size:18px;font-variant-numeric:tabular-nums">query ${it.query_score ?? '–'}</b>
+        <span class="meta" title="reward 是组内名次，要等同组兄弟样本判完才存在（POST /grade_group）">
+          reward 由组判给出，不在这条记录里${
+          dm.runtime ? ` · runtime ×${dm.runtime.factor}` : ''}</span>
+        <span class="meta">${hhmmss(it.ts)} · ${esc(it.task_id)}</span>
+      </div>
+      <div class="gate"><span class="g">需求</span>${chip(qScore, '',
+          it.query_score == null ? 'mid' : it.query_score >= 0.8 ? 'ok' : it.query_score >= 0.5 ? 'mid' : 'bad')}
+        <span class="t">${esc(qWhy)}${noVerdict(nq)}</span></div>
+      ${dm.runtime ? `<div class="gate"><span class="g">运行</span>${chip(`x${dm.runtime.factor}`, '',
+          dm.runtime.factor >= 1 ? 'ok' : 'bad')}
+        <span class="t">${esc(dm.runtime.why || '')}</span></div>` : ''}
+      ${it.drop_reason ? `<div class="gate"><span class="g" style="color:var(--bad)">drop</span>
+        <span class="t">${esc(it.drop_reason)}</span></div>` : ''}
+    </div>
+    ${it.has_shot ? `<div class="card"><h3>Judge 看到的整页截图</h3>
+      <img class="shot" src="api/shot/${it._id}"></div>` : ''}
+    <div class="card"><h3>Query</h3><div class="query">${esc(it.query)}</div></div>
+    ${it.has_raw ? `<div class="card"><h3>模型原始输出</h3><div id="raw">loading…</div></div>` : ''}
+    <div class="card"><h3>Timing / Signals</h3>
+      <div class="meta">extract ${t.extract_s ?? '–'}s · localize ${t.localize_s ?? '–'}s ·
+        render ${t.render_s ?? '–'}s · judges ${t.judges_s ?? '–'}s${
+        t.runtime_s != null ? ` · runtime ${t.runtime_s}s` : ''} ·
+        <b>total ${t.total_s ?? '–'}s</b></div>
+      <pre>${esc(JSON.stringify(s, null, 2))}</pre></div>`;
+  if (it.has_raw) {
+    const raw = await (await fetch(`api/raw/${it._id}`, {cache:'no-store'})).text();
+    if (SEL !== id || !$('#raw')) return;
+    // the split marker is built from char codes: writing the tag itself as a
+    // literal inside this script block gets corrupted on the way to disk and
+    // leaves the whole dashboard unparseable.
+    const THINK_END = String.fromCharCode(60)
+      + String.fromCharCode(47) + 'think'
+      + String.fromCharCode(62);
+    const cut = raw.lastIndexOf(THINK_END);
+    const think = cut >= 0 ? raw.slice(0, cut + THINK_END.length) : '';
+    const out = cut >= 0 ? raw.slice(cut + THINK_END.length) : raw;
+    $('#raw').innerHTML =
+      (think ? `<details><summary>thinking（${think.length.toLocaleString()} chars）</summary>
+                  <pre>${esc(think)}</pre></details>` : '') +
+      `<pre>${esc(out.trim())}</pre>`;
+  }
+}
+
+setInterval(() => { if ($('#auto').checked) load(); }, 3000);
+load();
+</script>
+</body>
+</html>

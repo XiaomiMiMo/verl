@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+# Fully-async weight synchronization imports CuPy at backend registration time.
+# Keep NumPy below 2.3 because the base image's SciPy 1.13.x requires it.
+RUN python3 -m pip install --no-cache-dir numpy==2.2.6 cupy-cuda12x==14.0.1 && \
+    python3 -c "import cupy, numpy, ray.util.collective, scipy, sglang, torch, zmq; print('NCCL checkpoint dependencies: OK', numpy.__version__)"

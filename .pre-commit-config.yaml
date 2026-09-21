@@ -52,7 +52,10 @@ repos:
 
       - id: validate-structure
         name: Validate test structure
-        entry: python3 tests/special_sanity/validate_structure.py
+        # `recipes` is exempt for the same reason the special_* folders are: the rule maps
+        # tests/<dir>/ onto a top-level package inside verl/, and a recipe is not one. Each
+        # arm's tests live beside the other arms' under tests/recipes/<arm>/.
+        entry: python3 tests/special_sanity/validate_structure.py --allow-dirs special_e2e special_sanity special_standalone special_distributed recipes
         language: python
         pass_filenames: false
 

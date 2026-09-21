@@ -1,0 +1,42 @@
+use_dataset_env: true
+
+agent:
+  type: codex-agent
+  ptc: true
+  compaction_enabled: false
+  nested_tool_call_errors: true
+  tools:
+    - tool: exec_command
+      config:
+        timeout: 300
+        max_timeout: 300
+    - tool: apply_patch
+  code_mode_host_path: ""
+  code_mode_exec_yield_time_ms: 300000
+  code_mode_wait_yield_time_ms: 100000
+  instance_template: |
+    Fix the following issue:
+
+    {{task}}
+  step_limit: 500
+
+environment:
+  cwd: "/testbed"
+  timeout: 300
+  environment_class: kubernetes
+  node_selector: {}
+  cpu_request: "0.5"
+  memory_request: "1Gi"
+  cpu_limit: "4"
+  memory_limit: "8Gi"
+  labels: {}
+  host_network: false
+  anti_hack_cleanup: true
+  raise_on_transport_error: true
+
+model:
+  model_name: policy
+  protocol: responses
+  model_kwargs:
+    base_url: ""
+    api_key: ""

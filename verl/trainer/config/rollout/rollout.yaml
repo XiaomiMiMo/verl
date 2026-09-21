@@ -160,6 +160,15 @@ val_kwargs:
   # Top-p sampling parameter. Default 1.0.
   top_p: 1.0
 
+  # Minimum token probability, as a fraction of the most likely token's. 0.0 disables it.
+  min_p: 0.0
+
+  # Additive penalty on tokens already present in the context. 0.0 disables it.
+  presence_penalty: 0.0
+
+  # Repetition penalty for validation sampling.
+  repetition_penalty: 1.0
+
   # Sampling temperature for rollout.
   temperature: 0
 

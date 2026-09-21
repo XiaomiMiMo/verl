@@ -14,10 +14,16 @@
 
 from unittest.mock import patch
 
+import pytest
+import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
-from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.trainer.ppo.v1.trainer_base import (
+    PPOTrainer,
+    _apply_tool_call_error_strategy,
+    _log_harness_rollout_metrics,
+)
 
 
 class _StubTrainer(PPOTrainer):
@@ -31,6 +37,92 @@ class _StubTrainer(PPOTrainer):
 class _CustomSampler:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+
+
+def test_log_harness_rollout_metrics_groups_reward_length_and_entropy():
+    metrics = {}
+    rewards = torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.5, 0.5]])
+    response_mask = torch.tensor([[1, 1], [1, 0], [1, 1]])
+    entropys = torch.tensor([[2.0, 4.0], [6.0, 0.0], [1.0, 3.0]])
+    num_turns = [4, 8, 10]
+
+    _log_harness_rollout_metrics(
+        metrics,
+        ["mimoagent", "claude-code", "mimoagent"],
+        rewards,
+        response_mask,
+        entropys,
+        num_turns,
+        tool_call_error_values={
+            "tool_call_error_count": [2, 0, 1],
+            "tool_call_error_invalid_arguments_count": [1, 0, 1],
+        },
+    )
+
+    assert metrics["harness/mimoagent/reward_mean"] == pytest.approx(1.0)
+    assert metrics["harness/mimoagent/response_length_mean"] == pytest.approx(2.0)
+    assert metrics["harness/mimoagent/entropy_mean"] == pytest.approx(2.5)
+    assert metrics["harness/mimoagent/num_turns/mean"] == pytest.approx(7.0)
+    assert metrics["harness/mimoagent/num_turns/min"] == pytest.approx(4.0)
+    assert metrics["harness/mimoagent/num_turns/max"] == pytest.approx(10.0)
+    assert metrics["harness/claude-code/reward_mean"] == pytest.approx(0.0)
+    assert metrics["harness/claude-code/response_length_mean"] == pytest.approx(1.0)
+    assert metrics["harness/claude-code/entropy_mean"] == pytest.approx(6.0)
+    assert metrics["harness/claude-code/num_turns/mean"] == pytest.approx(8.0)
+    assert metrics["harness/claude-code/num_turns/min"] == pytest.approx(8.0)
+    assert metrics["harness/claude-code/num_turns/max"] == pytest.approx(8.0)
+    assert metrics["harness/mimoagent/tool_call_error_rate"] == pytest.approx(1.0)
+    assert metrics["harness/mimoagent/tool_call_error_count/mean"] == pytest.approx(1.5)
+    assert metrics["harness/mimoagent/tool_call_error_invalid_arguments_count/mean"] == pytest.approx(1.0)
+    assert metrics["rollout/tool_call_error_rate"] == pytest.approx(2 / 3)
+
+
+def test_tool_call_error_monitor_preserves_response_mask():
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    error_mask = torch.tensor([[0, 1, 0], [0, 0, 0]])
+
+    updated, applied, metrics = _apply_tool_call_error_strategy(response_mask, error_mask, "monitor", penalty_value=0.5)
+
+    assert torch.equal(updated, response_mask)
+    assert torch.equal(applied, torch.tensor([[False, True, False], [False, False, False]]))
+    assert metrics["penalty/tool_call_error_tokens"] == 1.0
+    assert metrics["penalty/tool_call_error_sequences"] == 1.0
+    assert metrics["penalty/tool_call_error_rate"] == pytest.approx(1 / 5)
+
+
+def test_tool_call_error_mask_only_removes_marked_tokens():
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    error_mask = torch.tensor([[0, 1, 0], [1, 0, 1]])
+
+    updated, applied, _ = _apply_tool_call_error_strategy(response_mask, error_mask, "mask", penalty_value=0.0)
+
+    assert torch.equal(applied, torch.tensor([[False, True, False], [True, False, False]]))
+    assert torch.equal(updated, torch.tensor([[1, 0, 1], [0, 1, 0]]))
+
+
+def test_tool_call_error_invalid_shape_is_fail_closed():
+    response_mask = torch.ones((2, 3), dtype=torch.int64)
+    error_mask = torch.ones((2, 2), dtype=torch.int64)
+
+    updated, applied, metrics = _apply_tool_call_error_strategy(
+        response_mask, error_mask, "adv_reduction", penalty_value=1.0
+    )
+
+    assert torch.equal(updated, response_mask)
+    assert not applied.any()
+    assert metrics["penalty/tool_call_error_tokens"] == 0.0
+
+
+def test_tool_call_error_adv_set_mask_identifies_only_valid_error_tokens():
+    response_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    error_mask = torch.tensor([[0, 1, 0], [1, 0, 1]])
+
+    updated, applied, _ = _apply_tool_call_error_strategy(response_mask, error_mask, "adv_set", penalty_value=-1.0)
+    advantages = torch.tensor([[0.5, 0.5, 0.5], [0.0, 0.0, 0.0]])
+    result = torch.where(applied, torch.tensor(-1.0), advantages)
+
+    assert torch.equal(updated, response_mask)
+    assert torch.equal(result, torch.tensor([[0.5, -1.0, 0.5], [-1.0, 0.0, 0.0]]))
 
 
 def _trainer_with_filter_groups(filter_groups: dict, trainer_mode: str = "sync") -> _StubTrainer:

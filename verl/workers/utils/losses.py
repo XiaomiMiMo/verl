@@ -66,6 +66,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+    config.global_batch_info.pop("prompt_loss_weights", None)
+    if config.loss_agg_mode == "prompt-mean":
+        if "prompt_loss_weights" not in data:
+            raise ValueError("prompt-mean requires weights prepared over the complete optimizer batch")
+        config.global_batch_info["prompt_loss_weights"] = data["prompt_loss_weights"]
 
     # assumes that if any of the global batch info is set, the policy_loss_fn will
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM

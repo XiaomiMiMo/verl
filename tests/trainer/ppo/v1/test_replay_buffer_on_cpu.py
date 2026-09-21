@@ -147,6 +147,8 @@ class PromptSpec:
     global_steps: int = 0
     rewards: list[float] | None = None
     trajectory_keys: list[str] = field(default_factory=list)
+    reward_field: str = "extra_fields"
+    harnesses: list[str] | None = None
 
 
 class RolloutProducer(threading.Thread):
@@ -165,8 +167,14 @@ class RolloutProducer(threading.Thread):
                     key = _trajectory_key(spec.uid, session_id)
                     fields = {"input_ids": torch.tensor([1, 2, 3])}
                     tag = {"is_prompt": False, "seq_len": 3, "global_steps": spec.global_steps}
+                    if spec.harnesses is not None:
+                        tag["agent_type"] = spec.harnesses[session_id]
                     if spec.rewards is not None:
-                        fields["extra_fields"] = {"reward_extra_info": {"acc": float(spec.rewards[session_id])}}
+                        reward = float(spec.rewards[session_id])
+                        if spec.reward_field == "rm_scores":
+                            fields["rm_scores"] = torch.tensor([0.0, 0.0, reward])
+                        else:
+                            fields["extra_fields"] = {"reward_extra_info": {"acc": reward}}
                     tq.kv_put(
                         key=key,
                         partition_id=self.partition_id,
@@ -870,6 +878,28 @@ def test_async_dapo_refills_exact_missing_count(tq_init, partition_id):
         _clear_partition(partition_id)
 
 
+def test_dapo_reward_metric_uses_rm_scores_when_reward_is_not_extra_info(tq_init, partition_id):
+    all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0], reward_field="rm_scores")
+    mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0], reward_field="rm_scores")
+    _produce(partition_id, [all_same, mixed]).join_and_check()
+
+    refiller = FakeRefiller(partition_id, global_steps=1, sessions=2, rewards=[0.0, 1.0])
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        refill_fn=refiller,
+        filter_groups_metric="reward",
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=1, partition_id=partition_id, batch_size=2)
+        sampled_uids = _uids_of(batch.keys)
+        assert all_same.uid not in sampled_uids
+        assert mixed.uid in sampled_uids
+        assert refiller.calls == [1]
+        assert metrics["validation/filter_groups/evicted_samples"] == 1
+    finally:
+        _clear_partition(partition_id)
+
+
 def test_dapo_classification_cache_fetches_only_new_finished_groups(tq_init, partition_id, monkeypatch):
     first_filtered = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0])
     mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
@@ -969,6 +999,94 @@ def test_dapo_reports_filtered_reward_value_breakdown(tq_init, partition_id):
         _batch, metrics = rb.sample(global_steps=1, partition_id=partition_id, batch_size=1)
         assert metrics["validation/filter_groups/evicted_samples"] == 3
         assert metrics[DAPO_FILTERED_REWARD_COUNTS_KEY] == {0.0: 2, 1.0: 1}
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_dapo_reports_raw_group_success_histogram_before_filtering(tq_init, partition_id):
+    """The histogram counts all terminal groups, including no-signal groups."""
+    all_zero = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        rewards=[0.0, 0.0, 0.0, 0.0],
+        harnesses=["default"] * 4,
+    )
+    one_success = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        rewards=[0.0, 0.0, 0.0, 1.0],
+        harnesses=["cc-agent"] * 4,
+    )
+    mixed = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        rewards=[0.0, 1.0, 0.0, 1.0],
+        harnesses=["codex-agent"] * 4,
+    )
+    all_one = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        rewards=[1.0, 1.0, 1.0, 1.0],
+        harnesses=["bashonly-agent"] * 4,
+    )
+    _produce(partition_id, [all_zero, one_success, mixed, all_one]).join_and_check()
+
+    rb = _make_rb(trainer_mode="colocate_async", filter_groups_metric="acc", refill_fn=lambda _n: None)
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        reasons = rb._terminal_eviction_reasons(global_steps=1, partition_id=partition_id)
+        _evicted, _stale_count, _dapo_count, metrics = rb._evict_terminal_groups(
+            global_steps=1, partition_id=partition_id, eviction_reasons=reasons
+        )
+
+        assert metrics["validation/filter_groups/group_count"] == 4
+        assert metrics["validation/filter_groups/group_success_count/0"] == 1
+        assert metrics["validation/filter_groups/group_success_count/1"] == 1
+        assert metrics["validation/filter_groups/group_success_count/2"] == 1
+        assert metrics["validation/filter_groups/group_success_count/4"] == 1
+        assert metrics["validation/filter_groups/raw_group_passrate_sum"] == 1.75
+        assert metrics["validation/filter_groups/raw_reward_sum"] == 7.0
+        assert metrics["validation/filter_groups/raw_rollout_count"] == 16.0
+        assert metrics["validation/filter_groups/raw_passrate_zero_count"] == 1.0
+        assert metrics["validation/filter_groups/raw_passrate_one_count"] == 1.0
+        assert metrics["validation/filter_groups/raw_passrate_mid_count"] == 2.0
+        assert metrics["validation/filter_groups/raw_harness/default/group_count"] == 1.0
+        assert metrics["validation/filter_groups/raw_harness/default/group_passrate_sum"] == 0.0
+        assert metrics["validation/filter_groups/raw_harness/default/passrate_zero_count"] == 1.0
+        assert metrics["validation/filter_groups/raw_harness/cc-agent/group_passrate_sum"] == 0.25
+        assert metrics["validation/filter_groups/raw_harness/codex-agent/group_passrate_sum"] == 0.5
+        assert metrics["validation/filter_groups/raw_harness/bashonly-agent/group_passrate_sum"] == 1.0
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_dapo_reports_raw_metrics_for_paired_harness_subgroups(tq_init, partition_id):
+    spec = PromptSpec(
+        uid=_uid(),
+        status="finished",
+        sessions=4,
+        rewards=[0.0, 1.0, 0.0, 1.0],
+        harnesses=["bashonly-agent", "bashonly-agent", "cc-agent", "cc-agent"],
+    )
+    _produce(partition_id, [spec]).join_and_check()
+
+    rb = _make_rb(trainer_mode="colocate_async", filter_groups_metric="reward", refill_fn=lambda _n: None)
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        reasons = rb._terminal_eviction_reasons(global_steps=1, partition_id=partition_id)
+        _evicted, _stale_count, _dapo_count, metrics = rb._evict_terminal_groups(
+            global_steps=1, partition_id=partition_id, eviction_reasons=reasons
+        )
+        for harness in ("bashonly-agent", "cc-agent"):
+            prefix = f"validation/filter_groups/raw_harness/{harness}"
+            assert metrics[f"{prefix}/group_count"] == 1.0
+            assert metrics[f"{prefix}/group_passrate_sum"] == 0.5
+            assert metrics[f"{prefix}/rollout_count"] == 2.0
+            assert metrics[f"{prefix}/passrate_mid_count"] == 1.0
     finally:
         _clear_partition(partition_id)
 

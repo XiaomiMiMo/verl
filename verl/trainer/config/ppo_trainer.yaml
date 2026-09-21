@@ -130,6 +130,14 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Sentinel a recipe's agent loop writes when a rollout is invalidated by infrastructure
+  # (pod died, exec stream broke, verifier transport error / timeout) rather than by the model.
+  # Mirrors the reference RL framework's `algorithm.invalid_reward_value: -999`. When set, the GRPO advantage path
+  # replaces those scores with the group's valid mean and forces their advantage to 0, and
+  # compute_data_metrics excludes them from critic/score|rewards — so a few infra failures
+  # cannot swamp the reported curve. null disables the sentinel semantics.
+  invalid_reward_value: null
+
 # config for the trainer
 trainer:
 

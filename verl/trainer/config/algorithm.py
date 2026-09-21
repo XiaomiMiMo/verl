@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+    "ToolCallErrorPenaltyConfig",
+]
 
 
 @dataclass
@@ -57,6 +64,108 @@ class FilterGroupsConfig(BaseConfig):
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
     max_inflight_gen_batches: int = 1
+
+
+@dataclass
+class ToolCallErrorPenaltyConfig(BaseConfig):
+    """Optional token-level action for model-attributable tool-call errors.
+
+    ``monitor`` records the mask and leaves training unchanged. ``mask`` removes
+    marked generation tokens from the response loss. ``adv_reduction`` subtracts
+    ``penalty_value`` from their advantages after GRPO normalization, while
+    ``adv_set`` replaces their advantages with ``penalty_value``. Group filtering
+    is intentionally independent of this config.
+    """
+
+    enable: bool = False
+    strategy: str = "monitor"
+    penalty_value: float = 0.0
+
+    def __post_init__(self):
+        _validate_marked_token_penalty("tool_call_error_penalty", self.strategy, self.penalty_value)
+
+
+MARKED_TOKEN_PENALTY_STRATEGIES = frozenset({"monitor", "mask", "adv_reduction", "adv_set", "adv_signed"})
+
+
+def _validate_marked_token_penalty(name: str, strategy: str, penalty_value: float) -> None:
+    """Shared validation for the per-turn marked-token channels.
+
+    ``adv_signed`` is the reference RL framework's sign-aware, per-sign mass-conserving penalty
+    (``verl/trainer/ppo/signed_rebalance.py``): ``penalty_value`` is the multiplier
+    kappa applied to marked tokens of NEGATIVE samples (>= 1); marked tokens of
+    positive samples go to 0 and both sides are rebalanced over the train batch
+    (see ``algorithm.signed_min_scale`` / ``signed_max_scale``).
+    """
+    if strategy not in MARKED_TOKEN_PENALTY_STRATEGIES:
+        raise ValueError(f"{name}.strategy must be one of {', '.join(sorted(MARKED_TOKEN_PENALTY_STRATEGIES))}")
+    if strategy == "adv_reduction" and penalty_value < 0:
+        raise ValueError(f"{name}.penalty_value must be non-negative")
+    if strategy == "adv_set" and not math.isfinite(penalty_value):
+        raise ValueError(f"{name}.penalty_value must be finite for adv_set")
+    if strategy == "adv_signed" and not (math.isfinite(penalty_value) and penalty_value >= 1.0):
+        raise ValueError(f"{name}.penalty_value must be a finite multiplier >= 1 for adv_signed")
+
+
+@dataclass
+class RepetitionPenaltyConfig(BaseConfig):
+    """Token-level action for runaway n-gram repetition inside one generation turn.
+
+    The detection itself runs in the agent framework at scoring time (port of the reference RL framework's
+    ``dirty_repetition`` rule: an ``ngram_size``-token n-gram repeated ``min_repeat``
+    times inside a ``window_size`` window); it writes ``repetition_mask`` per trajectory
+    and may zero the session reward. This config only decides what the trainer does with
+    the marked tokens: ``monitor`` records metrics, ``mask`` removes them from the loss,
+    ``adv_reduction`` subtracts ``penalty_value`` from their advantages, ``adv_set``
+    replaces their advantages with ``penalty_value``. ``early_stop`` (EXPERIMENTAL, the reference RL framework
+    port) masks every generated token before the first hit span and applies
+    ``adv_signed`` with multiplier ``penalty_value`` on the hit spans; it must be paired
+    with ``repetition_detect.zero_reward=true``. The reward override lives in
+    ``actor_rollout_ref.rollout.custom.agent_framework.repetition_detect.zero_reward``.
+    """
+
+    enable: bool = False
+    strategy: str = "monitor"
+    penalty_value: float = 0.0
+
+    def __post_init__(self):
+        if self.strategy == "early_stop":
+            if not (math.isfinite(self.penalty_value) and self.penalty_value >= 1.0):
+                raise ValueError("repetition_penalty.penalty_value must be a finite multiplier >= 1 for early_stop")
+            return
+        _validate_marked_token_penalty("repetition_penalty", self.strategy, self.penalty_value)
+
+
+DEEP_FAILURE_MASK_STRATEGIES = frozenset({"mask_failure", "mask_both"})
+
+
+@dataclass
+class DeepFailureMaskConfig(BaseConfig):
+    """EXPERIMENTAL A/B channel: drop the deep-turn tail of a group's trajectories.
+
+    Per prompt group, ``k = ceil(alpha * median(num_turns of successful trajectories))``.
+    ``mask_failure`` clears ``response_mask`` for tokens of negative-advantage
+    trajectories whose generation-turn index is ``>= k``; ``mask_both`` clears every
+    trajectory's tokens from turn ``k`` on. Advantages are not edited. Groups without
+    a successful trajectory are untouched. Requires the agent framework to ship the
+    ``turn_index`` sequence field (``uni_agent`` ``_build_tq_fields``); when the field is
+    absent or misaligned the channel fails closed (no token masked) and reports
+    ``penalty/deep_failure_mask_status``. Disabled by default and must stay disabled
+    outside an explicitly named experiment profile: it is a biased estimator (removes
+    negative gradient mass) used only to test where deep-turn entropy growth comes from.
+    """
+
+    enable: bool = False
+    strategy: str = "mask_failure"
+    alpha: float = 1.0
+
+    def __post_init__(self):
+        if self.strategy not in DEEP_FAILURE_MASK_STRATEGIES:
+            raise ValueError(
+                f"deep_failure_mask.strategy must be one of {', '.join(sorted(DEEP_FAILURE_MASK_STRATEGIES))}"
+            )
+        if not (math.isfinite(self.alpha) and self.alpha > 0):
+            raise ValueError("deep_failure_mask.alpha must be a finite positive number")
 
 
 @dataclass
@@ -661,6 +770,11 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    tool_call_error_penalty: ToolCallErrorPenaltyConfig = field(default_factory=ToolCallErrorPenaltyConfig)
+    repetition_penalty: RepetitionPenaltyConfig = field(default_factory=RepetitionPenaltyConfig)
+    deep_failure_mask: DeepFailureMaskConfig = field(default_factory=DeepFailureMaskConfig)
+    signed_min_scale: float = 0.5
+    signed_max_scale: float = 2.0
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
@@ -670,3 +784,4 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    invalid_reward_value: Optional[float] = None

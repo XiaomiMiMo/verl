@@ -67,17 +67,30 @@ def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> to
     )
 
 
+def get_megatron_sequence_length_multiple(tensor_parallel_size: int, context_parallel_size: int) -> int:
+    """Return the sequence-length alignment required by Megatron preprocessing."""
+    if tensor_parallel_size < 1:
+        raise ValueError(f"tensor_parallel_size must be positive, got {tensor_parallel_size}")
+    if context_parallel_size < 1:
+        raise ValueError(f"context_parallel_size must be positive, got {context_parallel_size}")
+    if context_parallel_size > 1:
+        return tensor_parallel_size * context_parallel_size * 2
+    return tensor_parallel_size
+
+
 def construct_minimal_padding_template(
     source_td: dict,
     source_tag: dict,
     eos_token_id: int,
+    sequence_length_multiple: int = 1,
 ) -> tuple[dict, dict]:
-    """Construct a minimal text-only padding template of one prompt token and one response token.
+    """Construct a minimal text-only padding template with no trainable response tokens.
 
     Args:
         source_td: A single sample dict retrieved from TransferQueue.
         source_tag: The corresponding tag dict for that sample.
         eos_token_id: The EOS token id from the tokenizer.
+        sequence_length_multiple: Required alignment for the total sequence length.
 
     Returns:
         A tuple of (template_sample, template_tag) ready for padding.
@@ -91,18 +104,24 @@ def construct_minimal_padding_template(
     # Deep copy the template tag from an existing sample.
     template_tag = copy.deepcopy(source_tag)
 
-    # Build minimal sequence
-    prompts = torch.full((1,), eos_token_id, dtype=torch.int64)
-    input_ids = prompts.repeat(2)
+    if sequence_length_multiple < 1:
+        raise ValueError(f"sequence_length_multiple must be positive, got {sequence_length_multiple}")
+
+    seq_len = max(2, sequence_length_multiple)
+    prompt_len = seq_len - 1
+    response_len = 1
+    prompts = torch.full((prompt_len,), eos_token_id, dtype=torch.int64)
+    responses = torch.full((response_len,), eos_token_id, dtype=torch.int64)
+    input_ids = torch.cat((prompts, responses))
     attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-    response_mask = torch.zeros_like(prompts)
+    response_mask = torch.zeros_like(responses)
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
 
     # Update the fields and remove redundant parts
     template_sample.update(
         prompts=prompts,
-        responses=prompts.clone(),
+        responses=responses,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -120,7 +139,7 @@ def construct_minimal_padding_template(
         template_sample.pop("routed_experts", None)
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
-    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
+    template_tag.update(is_padding=True, prompt_len=prompt_len, response_len=response_len, seq_len=seq_len)
     return template_sample, template_tag
 
 
@@ -128,19 +147,20 @@ def upsample_batch_to_divisible_size(
     batch: KVBatchMeta,
     batch_multiple: int,
     eos_token_id: int,
+    sequence_length_multiple: int = 1,
 ) -> KVBatchMeta:
     """Append synthetic no-op samples so the batch size becomes divisible by *batch_multiple*.
 
     The synthetic samples reuse the first real sample as a metadata template,
-    but manually construct a minimal ``prompt_len=1 / response_len=1`` sequence
-    and zero out reward-related fields so they do not contribute to PPO,
-    entropy, or KL losses.  An ``is_padding`` flag is added in the tag for
-    downstream metrics filtering.
+    but manually construct a minimal aligned sequence and zero out reward-related
+    fields so they do not contribute to PPO, entropy, or KL losses. An
+    ``is_padding`` flag is added in the tag for downstream metrics filtering.
 
     Args:
         batch: The current KVBatchMeta from TransferQueue.
         batch_multiple: The required divisor (e.g. lcm of dp_size and mini-batch sizes).
         eos_token_id: The EOS token id from the tokenizer.
+        sequence_length_multiple: Required alignment for each synthetic sequence.
 
     Returns:
         The (possibly enlarged) KVBatchMeta.
@@ -154,8 +174,12 @@ def upsample_batch_to_divisible_size(
     source_key = batch.keys[source_idx]
     source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
 
-    # Construct the minimal padding template of one prompt token and one response token
-    template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id)
+    template_sample, template_tag = construct_minimal_padding_template(
+        source_td,
+        batch.tags[source_idx],
+        eos_token_id,
+        sequence_length_multiple=sequence_length_multiple,
+    )
 
     # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
     # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
@@ -183,11 +207,13 @@ def upsample_batch_to_divisible_size(
         tags=pad_tags,
     )
     logger.info(
-        "Upsampled batch from %d to %d with %d synthetic padding samples for required_multiple=%d",
+        "Upsampled batch from %d to %d with %d synthetic padding samples for "
+        "required_multiple=%d, sequence_length_multiple=%d",
         len(batch),
         len(batch) + pad_size,
         pad_size,
         batch_multiple,
+        sequence_length_multiple,
     )
     return KVBatchMeta(
         keys=batch.keys + pad_keys,

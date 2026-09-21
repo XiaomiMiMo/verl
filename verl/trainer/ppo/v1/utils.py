@@ -95,6 +95,10 @@ class MetricsAggregator:
             return "max"
         if any(keyword in metric_lower for keyword in ["min", "minimum"]):
             return "min"
+        if "/filter_groups/group_count" in metric_lower or "/filter_groups/group_success_count/" in metric_lower:
+            return "sum"
+        if "/filter_groups/raw_" in metric_lower and metric_lower.endswith(("_sum", "_count")):
+            return "sum"
         if any(keyword in metric_lower for keyword in ["sum", "total"]):
             return "sum"
         if any(keyword in metric_lower for keyword in ["weighted_avg", "mean", "avg", "average"]):
@@ -136,6 +140,58 @@ class MetricsAggregator:
         if {"global_seqlen/minmax_diff", "global_seqlen/max", "global_seqlen/min"}.issubset(aggregated):
             aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
 
+        for count_key in [key for key in list(aggregated) if key.endswith("/filter_groups/group_count")]:
+            prefix = count_key[: -len("/group_count")]
+            total_groups = float(aggregated[count_key])
+
+            raw_metric_keys = {
+                f"{prefix}/raw_group_passrate_sum",
+                f"{prefix}/raw_reward_sum",
+                f"{prefix}/raw_rollout_count",
+            }
+            if raw_metric_keys & aggregated.keys():
+                raw_group_passrate_sum = float(aggregated.pop(f"{prefix}/raw_group_passrate_sum", 0.0))
+                raw_reward_sum = float(aggregated.pop(f"{prefix}/raw_reward_sum", 0.0))
+                raw_rollout_count = float(aggregated.pop(f"{prefix}/raw_rollout_count", 0.0))
+                if total_groups:
+                    aggregated[f"{prefix}/raw/avg@n"] = raw_group_passrate_sum / total_groups
+                if raw_rollout_count:
+                    aggregated[f"{prefix}/raw/reward_mean"] = raw_reward_sum / raw_rollout_count
+                    aggregated[f"{prefix}/raw/rollout_count"] = raw_rollout_count
+                for bucket in ("zero", "one", "mid"):
+                    count = float(aggregated.pop(f"{prefix}/raw_passrate_{bucket}_count", 0.0))
+                    aggregated[f"{prefix}/raw/passrate/{bucket}"] = count / total_groups if total_groups else 0.0
+
+            marker = f"{prefix}/group_success_count/"
+            for key in list(aggregated):
+                if not key.startswith(marker):
+                    continue
+                success_count = key[len(marker) :]
+                ratio = float(aggregated[key]) / total_groups if total_groups else 0.0
+                aggregated[f"{prefix}/group_success_ratio/{success_count}"] = ratio
+
+        harness_marker = "/filter_groups/raw_harness/"
+        for count_key in [key for key in list(aggregated) if harness_marker in key and key.endswith("/group_count")]:
+            raw_prefix = count_key[: -len("/group_count")]
+            output_prefix = raw_prefix.replace(
+                "/filter_groups/raw_harness/",
+                "/filter_groups/raw/harness/",
+                1,
+            )
+            total_groups = float(aggregated.pop(count_key, 0.0))
+            raw_group_passrate_sum = float(aggregated.pop(f"{raw_prefix}/group_passrate_sum", 0.0))
+            raw_reward_sum = float(aggregated.pop(f"{raw_prefix}/reward_sum", 0.0))
+            raw_rollout_count = float(aggregated.pop(f"{raw_prefix}/rollout_count", 0.0))
+            aggregated[f"{output_prefix}/group_count"] = total_groups
+            if total_groups:
+                aggregated[f"{output_prefix}/avg@n"] = raw_group_passrate_sum / total_groups
+            if raw_rollout_count:
+                aggregated[f"{output_prefix}/reward_mean"] = raw_reward_sum / raw_rollout_count
+                aggregated[f"{output_prefix}/rollout_count"] = raw_rollout_count
+            for bucket in ("zero", "one", "mid"):
+                count = float(aggregated.pop(f"{raw_prefix}/passrate_{bucket}_count", 0.0))
+                aggregated[f"{output_prefix}/passrate/{bucket}"] = count / total_groups if total_groups else 0.0
+
         return aggregated
 
     def reset(self):
@@ -154,6 +210,7 @@ def compute_advantage_for_multi_trajectories(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Any = None,
+    group_suffixes: np.ndarray | list[str] | None = None,
 ) -> DataProto:
     """Compute GRPO advantages from each session's final output. For non-GRPO
     estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
@@ -187,6 +244,11 @@ def compute_advantage_for_multi_trajectories(
         if session_key not in final_sessions or final_sessions[session_key][0] < index:
             final_sessions[session_key] = (index, i)
 
+    if group_suffixes is not None:
+        group_suffixes = np.asarray(group_suffixes, dtype=object).reshape(-1)
+        if len(group_suffixes) != len(data):
+            raise ValueError(f"group_suffixes has {len(group_suffixes)} rows, expected {len(data)}")
+
     # final session indices in batch data
     final_indices = []
     session_key_to_local_index = {}
@@ -196,8 +258,15 @@ def compute_advantage_for_multi_trajectories(
     row_to_local_index = [session_key_to_local_index[session_key] for session_key in row_session_keys]
 
     # select final sessions from batch data for group relative advantage computation
+    final_data = data.select_idxs(final_indices)
+    if group_suffixes is not None:
+        base_uids = data.non_tensor_batch["uid"]
+        final_data.non_tensor_batch["uid"] = np.asarray(
+            [f"{base_uids[row_index]}::{group_suffixes[row_index]}" for row_index in final_indices],
+            dtype=object,
+        )
     final_data = compute_advantage(
-        data.select_idxs(final_indices),
+        final_data,
         adv_estimator=adv_estimator,
         gamma=gamma,
         lam=lam,

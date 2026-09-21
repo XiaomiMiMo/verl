@@ -426,7 +426,11 @@ class RolloutMoELoadBalanceMetricsAccumulator:
         return metrics
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(
+    batch: DataProto,
+    use_critic: bool = True,
+    invalid_reward_value: float | None = None,
+) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -437,6 +441,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
         use_critic: Whether to include critic-specific metrics. Defaults to True.
+        invalid_reward_value: ``algorithm.invalid_reward_value``. When set, rollouts carrying the
+            sentinel are excluded from the score/reward statistics. None keeps every row.
 
     Returns:
         A dictionary of metrics including:
@@ -468,8 +474,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask
 
-    non_aborted_sequence_score = sequence_score[non_aborted_mask]
-    non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+    if invalid_reward_value is not None:
+        valid_score_mask = non_aborted_mask & (sequence_score != invalid_reward_value)
+        valid_reward_mask = non_aborted_mask & (sequence_reward != invalid_reward_value)
+        n_invalid = int((non_aborted_mask & ~valid_score_mask).sum().item())
+        if n_invalid:
+            logger.warning(
+                "excluding %d infra-invalid sample(s) (reward==%s) from critic/score|rewards metrics",
+                n_invalid,
+                invalid_reward_value,
+            )
+    else:
+        valid_score_mask = non_aborted_mask
+        valid_reward_mask = non_aborted_mask
+
+    non_aborted_sequence_score = sequence_score[valid_score_mask]
+    non_aborted_sequence_reward = sequence_reward[valid_reward_mask]
 
     if non_aborted_sequence_score.numel() > 0:
         score_mean = torch.mean(non_aborted_sequence_score).detach().item()
@@ -605,7 +625,150 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    metrics.update(
+        _compute_passrate_metrics(
+            batch=batch,
+            sequence_reward=sequence_reward,
+            response_length=response_length,
+            invalid_reward_value=invalid_reward_value,
+        )
+    )
+
     return metrics
+
+
+def _compute_passrate_metrics(
+    batch: "DataProto",
+    sequence_reward: "torch.Tensor",
+    response_length: "torch.Tensor",
+    invalid_reward_value: float | None = None,
+) -> dict[str, float]:
+    """Per-uid passrate and per-source breakdown.
+
+    Emits (for both the global roll-up and each ``data_source`` split):
+      - ``train/passrate[/{src}]/avg_passrate``       — mean of per-uid passrate
+                                                        (the reference stack's
+                                                        ``dynsam/{src}/avg@n``)
+      - ``train/passrate[/{src}]/passrate_0_ratio``   — fraction of uids all 0
+      - ``train/passrate[/{src}]/passrate_1_ratio``   — fraction of uids all 1
+      - ``train/passrate[/{src}]/passrate_mid_ratio`` — the learnable middle
+      - ``train/passrate[/{src}]/num_uids``           — sample count
+      - ``train/passrate[/{src}]/hist10_ratio/{i}``   — 10-bucket passrate hist
+      - ``response_length/by_source/{src}/mean|max|min`` — per-source lengths
+
+    No-op if ``uid`` or ``data_source`` is missing from non_tensor_batch.
+    """
+    from collections import defaultdict
+
+    ntb = batch.non_tensor_batch
+    if "uid" not in ntb:
+        return {}
+
+    uids = ntb["uid"]
+    sources = ntb.get("data_source")
+    n_samples = len(uids)
+    if n_samples == 0:
+        return {}
+
+    rewards_np = sequence_reward.detach().cpu().numpy()
+    lens_np = response_length.detach().cpu().numpy()
+
+    uid_rewards: dict[str, list[float]] = defaultdict(list)
+    uid_lens: dict[str, list[float]] = defaultdict(list)
+    uid_source: dict[str, str] = {}
+    uid_total: dict[str, int] = defaultdict(int)
+    for i in range(n_samples):
+        u = str(uids[i])
+        s = str(sources[i]) if sources is not None else "_all"
+        uid_total[u] += 1
+        if invalid_reward_value is not None and float(rewards_np[i]) == invalid_reward_value:
+            continue
+        uid_rewards[u].append(float(rewards_np[i]))
+        uid_lens[u].append(float(lens_np[i]))
+        uid_source.setdefault(u, s)
+
+    src_passrates: dict[str, list[float]] = defaultdict(list)
+    src_passrates_no_infra: dict[str, list[float]] = defaultdict(list)
+    src_lens: dict[str, list[float]] = defaultdict(list)
+    for u, rs in uid_rewards.items():
+        src = uid_source[u]
+        pr = sum(rs) / len(rs)
+        src_passrates[src].append(pr)
+        threshold = min(2, uid_total[u])
+        if len(rs) >= threshold:
+            src_passrates_no_infra[src].append(pr)
+        src_lens[src].extend(uid_lens[u])
+
+    all_prs = [p for ps in src_passrates.values() for p in ps]
+    all_prs_no_infra = [p for ps in src_passrates_no_infra.values() for p in ps]
+    all_lens = [length for lengths in src_lens.values() for length in lengths]
+
+    def _emit_passrate_group(prefix: str, prs: list[float], out: dict) -> None:
+        n = len(prs)
+        if n == 0:
+            return
+        p0 = sum(1 for p in prs if p == 0.0) / n
+        p1 = sum(1 for p in prs if p >= 1.0 - 1e-9) / n
+        mid = 1.0 - p0 - p1
+        out[f"{prefix}/avg_passrate"] = sum(prs) / n
+        out[f"{prefix}/passrate_0_ratio"] = p0
+        out[f"{prefix}/passrate_1_ratio"] = p1
+        out[f"{prefix}/passrate_mid_ratio"] = mid
+        out[f"{prefix}/num_uids"] = n
+        for i in range(10):
+            lo, hi = i / 10.0, (i + 1) / 10.0
+            if i == 9:
+                cnt = sum(1 for p in prs if lo <= p <= hi)
+            else:
+                cnt = sum(1 for p in prs if lo <= p < hi)
+            out[f"{prefix}/hist10_ratio/{i}"] = cnt / n
+
+    def _emit_length_group(prefix: str, lens: list[float], out: dict) -> None:
+        if not lens:
+            return
+        out[f"{prefix}/mean"] = sum(lens) / len(lens)
+        out[f"{prefix}/max"] = max(lens)
+        out[f"{prefix}/min"] = min(lens)
+
+    out: dict[str, float] = {}
+    _emit_passrate_group("train/passrate", all_prs, out)
+    for src, prs in src_passrates.items():
+        _emit_passrate_group(f"train/passrate/{src}", prs, out)
+
+    def _emit_alias(prefix: str, prs: list[float], out: dict) -> None:
+        n = len(prs)
+        if n == 0:
+            return
+        p0 = sum(1 for p in prs if p == 0.0) / n
+        p1 = sum(1 for p in prs if p >= 1.0 - 1e-9) / n
+        mid = 1.0 - p0 - p1
+        out[f"{prefix}/passrate/zero"] = p0
+        out[f"{prefix}/passrate/one"] = p1
+        out[f"{prefix}/passrate/mid"] = mid
+        out[f"{prefix}/avg@n"] = sum(prs) / n
+        out[f"{prefix}/num_accepted/step"] = n
+
+    for src, prs in src_passrates.items():
+        _emit_alias(f"dynsam/{src}", prs, out)
+
+    if all_prs_no_infra:
+        out["train/passrate/avg_passrate_no_infra"] = sum(all_prs_no_infra) / len(all_prs_no_infra)
+        out["train/passrate/num_uids_no_infra"] = len(all_prs_no_infra)
+    for src, prs in src_passrates_no_infra.items():
+        if prs:
+            out[f"train/passrate/{src}/avg_passrate_no_infra"] = sum(prs) / len(prs)
+            out[f"train/passrate/{src}/num_uids_no_infra"] = len(prs)
+            out[f"dynsam/{src}/avg@n_no_infra"] = sum(prs) / len(prs)
+            out[f"dynsam/{src}/num_measurable"] = len(prs)
+            n = len(prs)
+            out[f"dynsam/{src}/passrate/zero_no_infra"] = sum(1 for p in prs if p == 0.0) / n
+            out[f"dynsam/{src}/passrate/one_no_infra"] = sum(1 for p in prs if p >= 1.0 - 1e-9) / n
+
+    _emit_length_group("response_length/by_source/_all", all_lens, out)
+    for src, lens in src_lens.items():
+        _emit_length_group(f"response_length/by_source/{src}", lens, out)
+
+    return out
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
