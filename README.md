@@ -1,3 +1,34 @@
+# XiaomiMiMo/verl
+
+Agentic RL training code for MiMo. The detailed training recipe can be found in Section 7.1 of our report [MiMo-V2.6: Scaling Reinforcement Learning Towards
+Self-Improvement](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/MiMo_V2_6_technical_report.pdf).
+
+This fork adds recipes for five RL environments upon [verl](https://github.com/verl-project/verl) (0.9.0.dev).
+
+| Domain | Task Family | Verifier | Launch script | Settings |
+|---|---|---|---|---|
+| Code | Software engineering | Executable tests | `scripts/code/train.sh` | `scripts/code/env.example` |
+| Cyber | Vulnerability reproduction | Rule checks | `scripts/arvo/arvo.sh` | `scripts/arvo/arvo.env.example` |
+| General | Knowledge work | Rubric-based judging | `scripts/general/general.sh` | `scripts/general/general.env.example` |
+| Visual | Web development | Visual grading | `scripts/design/webdev.sh` | `scripts/design/webdev.env.example` |
+| Music | Symbolic music composition | Rule checks | `scripts/design/music.sh` | `scripts/design/music.env.example` |
+
+- Training data: https://huggingface.co/datasets/XiaomiMiMo/MiMo-V2.6-RL-oss
+- Training model: https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B
+- Docker images: https://hub.docker.com/r/xiaomimimo/mimo-v2.6-rl-oss
+- Submodules (under `third_party/`; init with `git submodule update --init third_party/mimoagent-osr third_party/uni_agent`):
+  - mimoagent: https://github.com/XiaomiMiMo/mimoagent (`third_party/mimoagent-osr`, fork of [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)) — agent harnesses, tools, execution environments and graders. Used by Code, Cyber, General and Visual; Cyber, General and Visual drive it directly from a verl AgentLoop (`recipes/{arvo,general,design}/agent_loop.py`).
+  - uni-agent: https://github.com/XiaomiMiMo/uni-agent (`third_party/uni_agent`, fork of [verl-project/uni-agent](https://github.com/verl-project/uni-agent)) — model gateway and TransferQueue trajectory capture. Used by Code only: it replaces verl's agent-loop manager and runs the mimoagent harness inside a uni-agent session (`recipes/code/mimoagent_runner.py`).
+  - The two submodules do not import each other; the glue lives in `recipes/`. Music uses neither.
+
+Each launch script reads the variables listed in the `*.env.example` next to it; set those before launching.
+
+---
+
+> *The original verl README follows.*
+
+---
+
 <div align="center">
  👋 Hi, everyone!
     verl is a RL training library initiated by <b>ByteDance Seed team</b> and maintained by the verl community.
