@@ -1,9 +1,9 @@
 # XiaomiMiMo/verl
 
-Agentic RL training code for MiMo. The detailed training recipe can be found in Section 7.1 of our report [MiMo-V2.6: Scaling Reinforcement Learning Towards
+Agentic RL training code for MiMo. The detailed training recipe can be found in Section 7 of our report [MiMo-V2.6: Scaling Reinforcement Learning Towards
 Self-Improvement](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/MiMo_V2_6_technical_report.pdf).
 
-This fork adds recipes for five RL environments upon [verl](https://github.com/verl-project/verl) (0.9.0.dev).
+This fork adds reproduction code for five RL environments upon [verl](https://github.com/verl-project/verl) (0.9.0.dev).
 
 | Domain | Task Family | Verifier | Launch script | Settings |
 |---|---|---|---|---|
