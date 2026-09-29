@@ -499,6 +499,19 @@ class SGLangHttpServer:
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
+        # Drain in-flight generations before releasing engine memory.
+        # on_sample_end fires once all rollout data has been collected, but a
+        # client-abandoned generation can still be running inside the engine
+        # (e.g. a trajectory timeout kills the client, not the server request).
+        # release_memory_occupation then trips its no-ongoing-request
+        # assertion and the engine actor dies. abort_all_requests drains the
+        # engine (it loops on the model update lock) and the tracked generate
+        # tasks; resume_generation restores the acceptance gates that abort
+        # turned off -- nothing else resets them on the HYBRID wake path.
+        if self._generation_tasks:
+            await self.abort_all_requests()
+            await self.resume_generation()
+
         # When using LoRA as adapter (merge=False), only release kv_cache —
         # keep base weights in GPU so we only need to sync adapter deltas.
         # Mirrors the vLLM sleep() pattern in vllm_async_server.py.
