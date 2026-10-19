@@ -5,6 +5,9 @@ Self-Improvement](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/M
 
 This fork adds reproduction code for five RL environments upon [verl](https://github.com/verl-project/verl) (0.9.0.dev).
 
+> [!IMPORTANT]
+> **Update (2026-10-19):** The Code images now ship with anti-hack preprocessing already applied, and the preprocessing in [mimoagent](https://github.com/XiaomiMiMo/mimoagent) has been strengthened. Keep `anti_hack_cleanup: true` as in the provided configs.
+
 | Domain | Task Family | Verifier | Launch script | Settings |
 |---|---|---|---|---|
 | Code | Software engineering | Executable tests | `scripts/code/train.sh` | `scripts/code/env.example` |
